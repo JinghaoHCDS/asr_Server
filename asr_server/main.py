@@ -33,6 +33,7 @@ from asr_server.transcription import (
 
 
 DOCS_DESCRIPTION_PATH = Path(__file__).resolve().parent.parent / "docs" / "docs-endpoint-capabilities.md"
+MCP_TUTORIAL_PATH = Path(__file__).resolve().parent.parent / "docs" / "mcp-bridge.md"
 
 
 def gpu_health() -> dict[str, object]:
@@ -58,6 +59,13 @@ def docs_description() -> str:
             "WSL ASR Server API. Runtime model capabilities must be discovered "
             "from GET /v1/models."
         )
+
+
+def mcp_tutorial() -> str:
+    try:
+        return MCP_TUTORIAL_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return "# MCP setup tutorial\n\nThe MCP tutorial file is unavailable in this deployment.\n"
 
 
 def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 0.0) -> FastAPI:
@@ -120,6 +128,11 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
             "host": socket.gethostname(),
             "gpu": gpu_health(),
         }
+
+    @app.get("/docs/mcp", response_class=PlainTextResponse, tags=["documentation"])
+    async def mcp_setup_tutorial() -> PlainTextResponse:
+        """Return the Mac-side stdio MCP setup tutorial as Markdown."""
+        return PlainTextResponse(mcp_tutorial(), media_type="text/markdown")
 
     @app.get("/v1/models")
     async def list_models() -> dict[str, object]:

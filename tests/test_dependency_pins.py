@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import tomllib
 from pathlib import Path
 
 from asr_server.adapters.moss import MODEL_REVISIONS as MOSS_REVISIONS
@@ -23,3 +24,12 @@ def test_hugging_face_model_revisions_are_full_snapshot_ids() -> None:
 
     assert revisions
     assert all(re.fullmatch(r"[0-9a-f]{40}", revision) for revision in revisions)
+
+
+def test_mcp_bridge_stays_on_stable_v1_sdk_line() -> None:
+    pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+    optional_dependencies = pyproject["project"]["optional-dependencies"]["mcp"]
+    dev_dependencies = pyproject["dependency-groups"]["dev"]
+
+    assert "mcp>=1.27,<2" in optional_dependencies
+    assert "mcp>=1.27,<2" in dev_dependencies

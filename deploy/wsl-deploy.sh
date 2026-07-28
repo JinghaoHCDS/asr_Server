@@ -271,7 +271,7 @@ run_static_checks() {
 
   if [[ "${RUN_MYPY}" == "1" ]]; then
     log "running mypy"
-    "${DEPLOY_DIR}/.venv/bin/mypy" asr_server tests scripts
+    "${DEPLOY_DIR}/.venv/bin/mypy" asr_server asr_mcp tests scripts
   fi
 }
 

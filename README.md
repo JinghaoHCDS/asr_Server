@@ -17,6 +17,8 @@
 - `asr_server/`：FastAPI 应用、模型注册表、生命周期管理器、异步 job 队列和 ASR 适配器。
 - `tests/`：不依赖 CUDA 的 API、生命周期、临时文件清理、MOSS gate 和 job 行为测试。
 - `scripts/asr_client.py`：Mac 侧验证客户端，会绕过本机代理设置。
+- `asr_mcp/`：Mac 侧 stdio MCP bridge，通过现有 HTTP API 调用 WSL ASR Gateway。
+- `docs/mcp-bridge.md`：MCP Host 配置、安全限制和验收说明。
 - `scripts/qwen_asr_backend_smoke.py`：WSL 侧 Qwen3-ASR 后端最小验收脚本。
 - `scripts/moss_backend_smoke.py`：WSL 侧 MOSS 后端最小验收脚本。
 - `scripts/wsl_smoke.sh`：WSL 侧启动服务并运行 HTTP smoke test 的脚本。
@@ -62,9 +64,19 @@ Python 和依赖以 uv 为准：
 ```bash
 uv sync
 uv run pytest -q
-uv run mypy asr_server tests scripts
+uv run mypy asr_server asr_mcp tests scripts
 uv run uvicorn asr_server.main:app --host 0.0.0.0 --port 18080
 ```
+
+Mac 侧需要使用 MCP 时安装可选依赖：
+
+```bash
+uv sync --extra mcp
+ASR_MCP_ALLOWED_ROOTS=/path/to/audio \
+  uv run --extra mcp python -m asr_mcp.server
+```
+
+MCP bridge 使用 stdio，不监听新的网络端口；它通过 `ASR_MCP_BASE_URL` 调用现有 `18080` HTTP API。完整配置见 `docs/mcp-bridge.md`。
 
 WSL 真实部署优先使用一键脚本：
 

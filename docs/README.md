@@ -7,6 +7,7 @@
 - `asr-server-prd.md`：核心 API 合约、生命周期语义、错误信封和安全边界。
 - `wsl-deployment.md`：WSL Arch Linux 部署步骤、GPU 依赖、MOSS gate、systemd 和 smoke test。
 - `docs-endpoint-capabilities.md`：`/docs` Swagger UI 的说明文本来源，以及当前 API 能力声明。
+- `mcp-bridge.md`：Mac 侧 stdio MCP bridge 的配置、安全边界和验收方法。
 - `validation-template.md`：每次 WSL 真实模型验收的记录模板。
 
 ## 当前验收记录

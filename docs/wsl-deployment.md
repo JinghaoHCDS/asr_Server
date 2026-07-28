@@ -28,7 +28,7 @@ http://192.168.31.137:18080
 cd /home/fragt/services/asr-server
 uv sync
 uv run pytest -q
-uv run mypy asr_server tests scripts
+uv run mypy asr_server asr_mcp tests scripts
 ```
 
 ## 一键部署

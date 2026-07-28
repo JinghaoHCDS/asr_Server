@@ -651,6 +651,48 @@ WebSocket /v1/audio/transcriptions/stream?model=qwen3-asr-1.7b&language=auto
 }
 ```
 
+### 6.12 Mac 侧 MCP Bridge
+
+第一版 MCP 支持采用 Mac 侧 stdio bridge，不在 WSL FastAPI 中新增远程 MCP endpoint：
+
+```mermaid
+flowchart LR
+  Host["Mac MCP Host"] -->|stdio| Bridge["ASR MCP Bridge"]
+  Bridge -->|HTTP multipart, trust_env=false| Gateway["WSL ASR Gateway :18080"]
+  Gateway --> Runtime["现有 Model Lifecycle / Job Manager / Adapters"]
+```
+
+设计约束：
+
+- MCP 是现有 HTTP 接口的协议适配器，不替代 REST API，也不得重复实现模型生命周期、队列、切分、能力校验或推理逻辑。
+- `/v1/models` 仍是模型和能力真相来源；MCP Host 调用转录前应先执行能力发现。
+- bridge 运行在持有音频文件的 Mac 上，使用 multipart 把文件上传到 `18080`；不把本地音频转成 base64 放入 MCP JSON 参数。
+- bridge 使用 `httpx` 的 `trust_env=false` 访问局域网地址，避免 Mac 本机代理拦截请求。
+- WSL 不新增 MCP 端口，不开放 `8001`，也不恢复历史端口 `8765`。
+- 第一版不挂载远程 `/mcp`。后续若启用 Streamable HTTP MCP，必须先实现认证、`Origin` 校验和受控上传票据，并继续复用同一应用层实现。
+- FastAPI `/docs` 顶部必须提示 Mac 侧 MCP 用法，并链接到 `GET /docs/mcp`；该 endpoint 直接返回仓库内同一份 Markdown 教程，避免线上说明与仓库文档漂移。
+
+stdio MCP tools：
+
+| Tool | HTTP 映射 | 语义 |
+| --- | --- | --- |
+| `asr_list_models` | `GET /v1/models` | 查询模型、能力、后端和状态 |
+| `asr_get_model_status` | `GET /v1/models/{model_id}/status` | 查询单模型生命周期 |
+| `asr_transcribe_file` | `POST /v1/audio/transcriptions` | 上传本地音频；超过同步阈值时允许返回 job |
+| `asr_create_job` | `POST /v1/audio/transcription-jobs` | 显式创建异步 job |
+| `asr_get_job` | `GET /v1/jobs/{job_id}` | 查询真实阶段、chunk 进度和结果 |
+| `asr_cancel_job` | `DELETE /v1/jobs/{job_id}` | 使用既有安全取消语义 |
+| `asr_load_model` | `POST /v1/models/{model_id}/load` | 加载已声明模型 |
+| `asr_unload_model` | `DELETE /v1/models/{model_id}` | 使用既有等待活跃请求完成语义 |
+
+文件安全：
+
+- `ASR_MCP_ALLOWED_ROOTS` 必填，macOS 使用系统路径分隔符 `:` 配置一个或多个允许目录。
+- bridge 必须先解析真实路径，再确认目标是允许目录内的普通文件；指向目录外的符号链接必须拒绝。
+- bridge 在发起网络请求前执行路径和文件大小检查；越权路径不得产生 HTTP 请求。
+- `ASR_MCP_MAX_FILE_MB` 默认与服务端上传限制一致为 512 MB，但服务端限制仍是最终约束。
+- MCP tool error 应保留服务端错误信封中的稳定 `code` 和 `message`，不得把 `capability_not_supported` 等错误静默降级为表面成功。
+
 ## 7. 错误码
 
 统一错误格式：
@@ -755,6 +797,8 @@ limits:
 - 上传音频写入临时目录，推理结束后清理。
 - 同步转录、异步 job、音频解码、切分和模型适配器产生的临时文件必须在请求完成、失败或取消后清理；job 结果 TTL 只允许保留内存中的结果和状态，不保留上传音频或中间音频文件。
 - 日志不默认保存完整音频内容。
+- Mac 侧 MCP bridge 只能读取 `ASR_MCP_ALLOWED_ROOTS` 内解析后的普通文件，不允许把整个 home 目录或文件系统根目录作为生产配置。
+- MCP 配置中的 `ASR_MCP_TOKEN` 只能通过 MCP Host 环境变量注入，不写入 Git、命令行日志或工具返回值。
 
 ## 11. 验收标准
 
@@ -796,6 +840,14 @@ limits:
 
 - 请求未声明的高级能力，例如 timestamps、forced alignment 或 streaming，返回 `capability_not_supported`，或在能力未声明时由客户端避免发起该请求。
 - 任意出现在 `/v1/models` capabilities 中的能力都必须有对应的 Mac 到 WSL 端到端验收记录。
+
+MCP：
+
+- Mac MCP Host 通过 stdio 启动 bridge，`tools/list` 能发现 8 个 ASR tools。
+- `asr_list_models` 的模型和能力结果与 HTTP `GET /v1/models` 一致。
+- 允许目录内短音频可通过 `asr_transcribe_file` 得到非空 `text`；长音频可创建 job 并获取真实 chunk 进度。
+- 允许目录外文件和解析后逃逸目录的符号链接返回 ToolError，且不会向 WSL 发起 HTTP 请求。
+- MCP 调用不新增局域网监听端口，真实推理仍只发生在 WSL Arch Linux GPU 环境。
 
 ## 12. 后续路线
 
