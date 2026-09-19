@@ -15,6 +15,7 @@ class Settings:
     default_model: str = "qwen3-asr-1.7b"
     adapter: AdapterMode = "mock"
     enable_moss: bool = False
+    enable_qwen_alignment: bool = False
     qwen_batch_size: int = 1
     job_result_ttl_seconds: int = 3600
     idle_unload_seconds: float = 180.0
@@ -39,6 +40,7 @@ def load_settings() -> Settings:
         raise ValueError("ASR_ADAPTER must be 'mock' or 'qwen'")
     adapter_mode = cast(AdapterMode, adapter)
     enable_moss = _env_bool("ASR_ENABLE_MOSS", default=False)
+    enable_qwen_alignment = _env_bool("ASR_ENABLE_QWEN_ALIGNMENT", default=False)
     qwen_batch_size = int(os.getenv("ASR_QWEN_BATCH_SIZE", "1"))
     if qwen_batch_size < 1:
         raise ValueError("ASR_QWEN_BATCH_SIZE must be greater than or equal to 1")
@@ -74,6 +76,7 @@ def load_settings() -> Settings:
         default_model=os.getenv("ASR_DEFAULT_MODEL", "qwen3-asr-1.7b"),
         adapter=adapter_mode,
         enable_moss=enable_moss,
+        enable_qwen_alignment=enable_qwen_alignment,
         qwen_batch_size=qwen_batch_size,
         job_result_ttl_seconds=job_result_ttl_seconds,
         idle_unload_seconds=idle_unload_seconds,

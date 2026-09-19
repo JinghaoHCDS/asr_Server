@@ -101,6 +101,7 @@ class PathSplitResult:
     hard_chunk_seconds: float
     overlap_seconds: float
     vad_backend: str | None = None
+    speech_intervals: tuple[tuple[float, float], ...] = ()
     warnings: list[str] = field(default_factory=list)
 
     def summary(self) -> dict[str, object]:
@@ -108,6 +109,7 @@ class PathSplitResult:
             "strategy": self.strategy,
             "requested_strategy": self.requested_strategy,
             "vad_backend": self.vad_backend,
+            "speech_interval_count": len(self.speech_intervals),
             "chunk_count": len(self.chunks),
             "soft_chunk_seconds": self.soft_chunk_seconds,
             "hard_chunk_seconds": self.hard_chunk_seconds,
@@ -261,6 +263,7 @@ def split_audio_path(
     _validate_chunk_options(chunk_seconds, overlap, hard_chunk_seconds)
     warnings: list[str] = []
     vad_backend: str | None = None
+    speech_intervals: tuple[tuple[float, float], ...] = ()
     if strategy == "none":
         if metadata.duration_seconds > hard_chunk_seconds:
             raise AsrError(
@@ -286,6 +289,7 @@ def split_audio_path(
                 cancel_event=cancel_event,
             )
         if intervals:
+            speech_intervals = tuple(intervals)
             windows = _pack_vad_intervals(intervals, chunk_seconds, overlap)
             resolved_strategy = "energy"
             vad_backend = "energy"
@@ -304,6 +308,7 @@ def split_audio_path(
         hard_chunk_seconds=hard_chunk_seconds,
         overlap_seconds=overlap,
         vad_backend=vad_backend,
+        speech_intervals=speech_intervals,
         warnings=warnings,
     )
 

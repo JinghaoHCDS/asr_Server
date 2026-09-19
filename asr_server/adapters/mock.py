@@ -8,6 +8,7 @@ from asr_server.adapters.base import (
     AudioInput,
     AudioComposition,
     AudioPath,
+    ContextApplication,
     GenerationMetrics,
     TranscriptionResult,
     TranscriptionSegment,
@@ -43,7 +44,8 @@ class MockAsrAdapter:
         backend: str,
         language: str,
         context: str,
-        max_new_tokens: int | None,
+        timestamps: str = "none",
+        max_new_tokens: int | None = None,
     ) -> TranscriptionResult:
         inference_started = perf_counter()
         if self.delay_seconds > 0:
@@ -55,6 +57,7 @@ class MockAsrAdapter:
             backend=backend,
             language=language,
             context=context,
+            timestamps=timestamps,
             max_new_tokens=max_new_tokens,
             inference_ms=inference_ms,
             batch=False,
@@ -69,7 +72,8 @@ class MockAsrAdapter:
         backend: str,
         language: str,
         context: str,
-        max_new_tokens: int | None,
+        timestamps: str = "none",
+        max_new_tokens: int | None = None,
     ) -> list[TranscriptionResult]:
         inference_started = perf_counter()
         if self.delay_seconds > 0:
@@ -83,6 +87,7 @@ class MockAsrAdapter:
                 backend=backend,
                 language=language,
                 context=context,
+                timestamps=timestamps,
                 max_new_tokens=max_new_tokens,
                 inference_ms=per_chunk_inference_ms,
                 batch=True,
@@ -99,12 +104,13 @@ class MockAsrAdapter:
         backend: str,
         language: str,
         context: str,
+        timestamps: str,
         max_new_tokens: int | None,
         inference_ms: float,
         batch: bool,
         label: str,
     ) -> TranscriptionResult:
-        del backend
+        del backend, timestamps
         audio_size = (
             audio.path.stat().st_size
             if isinstance(audio, AudioPath)
@@ -140,6 +146,13 @@ class MockAsrAdapter:
             segments=segments,
             timings=TranscriptionTimings(inference_ms=inference_ms),
             generation=GenerationMetrics(max_new_tokens=max_new_tokens),
+            context=ContextApplication(
+                requested=bool(context),
+                applied=bool(context),
+                method="mock_prompt" if context else None,
+                input_chars=len(context),
+                used_chars=len(context),
+            ),
         )
 
 

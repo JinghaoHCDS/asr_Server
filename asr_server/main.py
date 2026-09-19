@@ -86,6 +86,7 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
             )
         return QwenAsrAdapter(
             model_id,
+            enable_alignment=app_settings.enable_qwen_alignment,
             startup_timeout_seconds=app_settings.worker_startup_timeout_seconds,
             load_timeout_seconds=app_settings.worker_load_timeout_seconds,
             inference_timeout_seconds=app_settings.worker_inference_timeout_seconds,
@@ -112,7 +113,11 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
     app.add_exception_handler(AsrError, cast(Any, asr_error_handler))
     app.add_exception_handler(RequestValidationError, cast(Any, validation_error_handler))
     app.state.manager = ModelLifecycleManager(
-        default_models(app_settings.default_model, enable_moss=app_settings.enable_moss),
+        default_models(
+            app_settings.default_model,
+            enable_moss=app_settings.enable_moss,
+            enable_qwen_alignment=app_settings.enable_qwen_alignment,
+        ),
         adapter_factory,
         idle_unload_seconds=app_settings.idle_unload_seconds,
     )
@@ -177,18 +182,21 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
         file: Annotated[UploadFile, File()],
         model: Annotated[str | None, Form()] = None,
         language: Annotated[str, Form()] = "auto",
-        response_format: Annotated[str, Form()] = "json",
-        timestamps: Annotated[str, Form()] = "none",
+        response_format: Annotated[str | None, Form()] = None,
+        timestamps: Annotated[str | None, Form()] = None,
         backend: Annotated[Backend, Form()] = "auto",
         temperature: Annotated[float | None, Form()] = None,
         max_new_tokens: Annotated[int | None, Form(ge=1)] = None,
         context: Annotated[str, Form()] = "",
         hotwords: Annotated[str | None, Form()] = None,
-        split_strategy: Annotated[str, Form()] = "auto",
+        split_strategy: Annotated[str | None, Form()] = None,
         max_chunk_seconds: Annotated[float | None, Form()] = None,
         overlap_seconds: Annotated[float | None, Form()] = None,
-        preserve_segments: Annotated[bool, Form()] = False,
-        speaker_resolution: Annotated[str, Form()] = "off",
+        preserve_segments: Annotated[bool | None, Form()] = None,
+        speaker_resolution: Annotated[str | None, Form()] = None,
+        purpose: Annotated[str, Form()] = "transcription",
+        pause_threshold_seconds: Annotated[float, Form()] = 0.8,
+        idempotency_key: Annotated[str | None, Form()] = None,
     ) -> dict[str, object] | PlainTextResponse | JSONResponse:
         del temperature
         manager: ModelLifecycleManager = app.state.manager
@@ -206,6 +214,9 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
             overlap_seconds=overlap_seconds,
             preserve_segments=preserve_segments,
             speaker_resolution=speaker_resolution,
+            purpose=purpose,
+            pause_threshold_seconds=pause_threshold_seconds,
+            idempotency_key=idempotency_key,
         )
         validated = validate_transcription_request(manager, request)
         workspace = await app.state.workspace_manager.store_upload(file)
@@ -240,7 +251,7 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
         finally:
             if not transferred:
                 await workspace.cleanup()
-        if response_format == "text":
+        if request.response_format == "text":
             return PlainTextResponse(cast(str, result["text"]))
         return result
 
@@ -249,18 +260,21 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
         file: Annotated[UploadFile, File()],
         model: Annotated[str | None, Form()] = None,
         language: Annotated[str, Form()] = "auto",
-        response_format: Annotated[str, Form()] = "json",
-        timestamps: Annotated[str, Form()] = "none",
+        response_format: Annotated[str | None, Form()] = None,
+        timestamps: Annotated[str | None, Form()] = None,
         backend: Annotated[Backend, Form()] = "auto",
         temperature: Annotated[float | None, Form()] = None,
         max_new_tokens: Annotated[int | None, Form(ge=1)] = None,
         context: Annotated[str, Form()] = "",
         hotwords: Annotated[str | None, Form()] = None,
-        split_strategy: Annotated[str, Form()] = "auto",
+        split_strategy: Annotated[str | None, Form()] = None,
         max_chunk_seconds: Annotated[float | None, Form()] = None,
         overlap_seconds: Annotated[float | None, Form()] = None,
-        preserve_segments: Annotated[bool, Form()] = False,
-        speaker_resolution: Annotated[str, Form()] = "off",
+        preserve_segments: Annotated[bool | None, Form()] = None,
+        speaker_resolution: Annotated[str | None, Form()] = None,
+        purpose: Annotated[str, Form()] = "transcription",
+        pause_threshold_seconds: Annotated[float, Form()] = 0.8,
+        idempotency_key: Annotated[str | None, Form()] = None,
     ) -> dict[str, object]:
         del temperature
         request = _transcription_request(
@@ -277,6 +291,9 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
             overlap_seconds=overlap_seconds,
             preserve_segments=preserve_segments,
             speaker_resolution=speaker_resolution,
+            purpose=purpose,
+            pause_threshold_seconds=pause_threshold_seconds,
+            idempotency_key=idempotency_key,
         )
         manager: ModelLifecycleManager = app.state.manager
         validate_transcription_request(manager, request)
@@ -294,9 +311,9 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
             raise
 
     @app.get("/v1/jobs/{job_id}")
-    async def get_transcription_job(job_id: str) -> dict[str, object]:
+    async def get_transcription_job(job_id: str, detail: str = "compact") -> dict[str, object]:
         job_manager: JobManager = app.state.job_manager
-        return await job_manager.get_job(job_id)
+        return await job_manager.get_job(job_id, detail=detail)
 
     @app.delete("/v1/jobs/{job_id}")
     async def cancel_transcription_job(job_id: str) -> dict[str, object]:
@@ -318,32 +335,44 @@ def _transcription_request(
     *,
     model: str | None,
     language: str,
-    response_format: str,
-    timestamps: str,
+    response_format: str | None,
+    timestamps: str | None,
     backend: Backend,
     max_new_tokens: int | None,
     context: str,
     hotwords: str | None,
-    split_strategy: str,
+    split_strategy: str | None,
     max_chunk_seconds: float | None,
     overlap_seconds: float | None,
-    preserve_segments: bool,
-    speaker_resolution: str,
+    preserve_segments: bool | None,
+    speaker_resolution: str | None,
+    purpose: str,
+    pause_threshold_seconds: float,
+    idempotency_key: str | None,
 ) -> TranscriptionRequest:
+    profile_defaults = {
+        "transcription": ("json", "none", False, "off"),
+        "oral_analysis": ("verbose_json", "auto", True, "off"),
+        "podcast": ("verbose_json", "none", True, "auto"),
+    }
+    defaults = profile_defaults.get(purpose, profile_defaults["transcription"])
     return TranscriptionRequest(
         model=model,
         language=language,
-        response_format=response_format,
-        timestamps=timestamps,
+        response_format=response_format or defaults[0],
+        timestamps=timestamps or defaults[1],
         backend=backend,
         max_new_tokens=max_new_tokens,
         context=context,
         hotwords=hotwords,
-        split_strategy=split_strategy,
+        split_strategy=split_strategy or "auto",
         max_chunk_seconds=max_chunk_seconds,
         overlap_seconds=overlap_seconds,
-        preserve_segments=preserve_segments,
-        speaker_resolution=speaker_resolution,
+        preserve_segments=defaults[2] if preserve_segments is None else preserve_segments,
+        speaker_resolution=speaker_resolution or defaults[3],
+        purpose=purpose,
+        pause_threshold_seconds=pause_threshold_seconds,
+        idempotency_key=idempotency_key,
     )
 
 

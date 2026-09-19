@@ -34,6 +34,7 @@ class AnchorReplayConfig:
     min_anchor_seconds: float = 2.0
     silence_seconds: float = 0.5
     max_prefix_seconds: float = 60.0
+    max_speakers: int = 4
 
 
 @dataclass(frozen=True)
@@ -71,6 +72,7 @@ class AnchorReplaySequence:
         self._budget_limited = False
         self._candidate_speakers: set[str] = set()
         self._missing_segment_chunks = 0
+        self._speaker_capacity_exceeded = 0
 
     def __len__(self) -> int:
         return len(self._chunks)
@@ -142,11 +144,13 @@ class AnchorReplaySequence:
                 and local_speaker in anchorable_local_speakers
                 and (index == 0 or anchors_complete)
             ):
-                global_speaker = self._allocate_speaker()
-                local_to_global[local_speaker] = global_speaker
-                resolution = "initial" if index == 0 else "new_candidate"
-                if index > 0:
-                    self._candidate_speakers.add(global_speaker)
+                allocated = self._allocate_speaker()
+                if allocated is not None:
+                    global_speaker = allocated
+                    local_to_global[local_speaker] = global_speaker
+                    resolution = "initial" if index == 0 else "new_candidate"
+                    if index > 0:
+                        self._candidate_speakers.add(global_speaker)
             if global_speaker is None:
                 self._unresolved_segments += 1
                 resolution = "unresolved"
@@ -196,6 +200,7 @@ class AnchorReplaySequence:
             or self._budget_limited
             or bool(self._candidate_speakers)
             or self._missing_segment_chunks > 0
+            or self._speaker_capacity_exceeded > 0
         )
         return {
             "method": "moss_anchor_replay",
@@ -207,6 +212,8 @@ class AnchorReplaySequence:
             "anchor_budget_limited": self._budget_limited,
             "candidate_speakers": len(self._candidate_speakers),
             "missing_segment_chunks": self._missing_segment_chunks,
+            "max_speakers": self._config.max_speakers,
+            "speaker_capacity_exceeded": self._speaker_capacity_exceeded,
         }
 
     def _resolve_anchor_labels(
@@ -248,7 +255,10 @@ class AnchorReplaySequence:
             complete = False
         return proposed, complete
 
-    def _allocate_speaker(self) -> str:
+    def _allocate_speaker(self) -> str | None:
+        if self._next_speaker > self._config.max_speakers:
+            self._speaker_capacity_exceeded += 1
+            return None
         speaker = f"speaker-{self._next_speaker:04d}"
         self._next_speaker += 1
         return speaker

@@ -29,9 +29,10 @@ class FailingLoadAdapter:
         backend: str,
         language: str,
         context: str,
-        max_new_tokens: int | None,
+        timestamps: str = "none",
+        max_new_tokens: int | None = None,
     ) -> TranscriptionResult:
-        del audio, model_id, backend, language, context, max_new_tokens
+        del audio, model_id, backend, language, context, timestamps, max_new_tokens
         raise AssertionError("transcribe should not run when load fails")
 
     async def transcribe_batch(
@@ -42,9 +43,10 @@ class FailingLoadAdapter:
         backend: str,
         language: str,
         context: str,
-        max_new_tokens: int | None,
+        timestamps: str = "none",
+        max_new_tokens: int | None = None,
     ) -> list[TranscriptionResult]:
-        del audio_chunks, model_id, backend, language, context, max_new_tokens
+        del audio_chunks, model_id, backend, language, context, timestamps, max_new_tokens
         raise AssertionError("transcribe_batch should not run when load fails")
 
 
@@ -81,9 +83,10 @@ class RecordingAdapter:
         backend: str,
         language: str,
         context: str,
-        max_new_tokens: int | None,
+        timestamps: str = "none",
+        max_new_tokens: int | None = None,
     ) -> TranscriptionResult:
-        del audio, model_id, backend, context, max_new_tokens
+        del audio, model_id, backend, context, timestamps, max_new_tokens
         self.active_transcribes += 1
         self.transcribe_started.set()
         self.max_parallel_transcribes = max(self.max_parallel_transcribes, self.active_transcribes)
@@ -99,9 +102,10 @@ class RecordingAdapter:
         backend: str,
         language: str,
         context: str,
-        max_new_tokens: int | None,
+        timestamps: str = "none",
+        max_new_tokens: int | None = None,
     ) -> list[TranscriptionResult]:
-        del audio_chunks, model_id, backend, language, context, max_new_tokens
+        del audio_chunks, model_id, backend, language, context, timestamps, max_new_tokens
         raise AssertionError("batch path is not used in this test")
 
 
@@ -273,9 +277,10 @@ async def test_different_models_share_one_global_gpu_operation() -> None:
             backend: str,
             language: str,
             context: str,
-            max_new_tokens: int | None,
+            timestamps: str = "none",
+            max_new_tokens: int | None = None,
         ) -> TranscriptionResult:
-            del audio, model_id, backend, language, context, max_new_tokens
+            del audio, model_id, backend, language, context, timestamps, max_new_tokens
             nonlocal active, maximum
             with monitor_lock:
                 active += 1

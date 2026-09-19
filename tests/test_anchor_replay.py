@@ -89,6 +89,36 @@ def test_anchor_replay_keeps_four_speakers_stable_when_local_labels_are_permuted
     assert summary["unresolved_segments"] == 0
 
 
+def test_anchor_replay_does_not_force_a_fifth_speaker_into_a_to_d_scope(tmp_path: Path) -> None:
+    audio_path = tmp_path / "source.wav"
+    _write_wav(audio_path, 100.0)
+    sequence = AnchorReplaySequence(
+        [ChunkDescriptor(index=0, start=0.0, end=100.0, audio_path=audio_path)],
+        config=AnchorReplayConfig(min_anchor_seconds=1.0, max_speakers=4),
+    )
+
+    result = sequence.accept(
+        0,
+        _result(
+            (0.0, 2.0, "S01", "一"),
+            (2.0, 4.0, "S02", "二"),
+            (4.0, 6.0, "S03", "三"),
+            (6.0, 8.0, "S04", "四"),
+            (8.0, 10.0, "S05", "五"),
+        ),
+    )
+
+    assert [segment.speaker for segment in result.segments] == [
+        "speaker-0001",
+        "speaker-0002",
+        "speaker-0003",
+        "speaker-0004",
+        None,
+    ]
+    assert result.segments[-1].speaker_resolution == "unresolved"
+    assert sequence.summary()["speaker_capacity_exceeded"] == 1
+
+
 def test_anchor_replay_does_not_merge_two_global_speakers_when_anchor_labels_conflict(tmp_path: Path) -> None:
     audio_path = tmp_path / "source.wav"
     _write_wav(audio_path, 40.0)

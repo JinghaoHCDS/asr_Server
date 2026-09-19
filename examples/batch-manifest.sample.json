@@ -1,0 +1,32 @@
+{
+  "items": [
+    {
+      "id": "sample-oral-001",
+      "path": "/Users/replace-me/media/oral-001.wav",
+      "title": "合成口播清单样例",
+      "source": "local-sample",
+      "description": "这是格式样例，不是实际素材。",
+      "purpose": "oral_analysis",
+      "language": "auto",
+      "context": "本条涉及 Qwen3-ASR 与 RTX 5070 Ti。",
+      "keywords": [
+        "Qwen3-ASR",
+        "RTX 5070 Ti"
+      ]
+    },
+    {
+      "id": "sample-podcast-001",
+      "path": "/Users/replace-me/media/podcast-001.m4a",
+      "title": "合成播客清单样例",
+      "source": "local-sample",
+      "description": "这是格式样例，不是实际素材。",
+      "purpose": "podcast",
+      "language": "auto",
+      "context": "本期讨论 MLX 与 CUDA。",
+      "keywords": [
+        "MLX",
+        "CUDA"
+      ]
+    }
+  ]
+}

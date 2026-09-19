@@ -44,6 +44,50 @@ class TranscriptionSegment:
 
 
 @dataclass(frozen=True)
+class TimestampItem:
+    text: str
+    start: float
+    end: float
+    granularity: str
+    source: str = "qwen3_forced_aligner"
+    status: str = "aligned"
+
+    def to_api(self) -> dict[str, object]:
+        return {
+            "text": self.text,
+            "start": self.start,
+            "end": self.end,
+            "granularity": self.granularity,
+            "source": self.source,
+            "status": self.status,
+        }
+
+
+@dataclass(frozen=True)
+class ContextApplication:
+    requested: bool = False
+    applied: bool = False
+    method: str | None = None
+    input_chars: int = 0
+    used_chars: int = 0
+    hotword_count: int = 0
+    truncated: bool = False
+    ignored_reason: str | None = None
+
+    def to_api(self) -> dict[str, object]:
+        return {
+            "requested": self.requested,
+            "applied": self.applied,
+            "method": self.method,
+            "input_chars": self.input_chars,
+            "used_chars": self.used_chars,
+            "hotword_count": self.hotword_count,
+            "truncated": self.truncated,
+            "ignored_reason": self.ignored_reason,
+        }
+
+
+@dataclass(frozen=True)
 class GenerationMetrics:
     prompt_tokens: int | None = None
     generated_tokens: int | None = None
@@ -51,8 +95,12 @@ class GenerationMetrics:
     peak_vram_allocated_mb: float | None = None
     segment_coverage_end_seconds: float | None = None
     segment_coverage_ratio: float | None = None
+    audible_speech_end_seconds: float | None = None
+    uncovered_speech_intervals: int | None = None
+    truncated: bool = False
+    finish_reason: str | None = None
 
-    def to_api(self) -> dict[str, int | float | None]:
+    def to_api(self) -> dict[str, object]:
         return {
             "prompt_tokens": self.prompt_tokens,
             "generated_tokens": self.generated_tokens,
@@ -60,6 +108,10 @@ class GenerationMetrics:
             "peak_vram_allocated_mb": self.peak_vram_allocated_mb,
             "segment_coverage_end_seconds": self.segment_coverage_end_seconds,
             "segment_coverage_ratio": self.segment_coverage_ratio,
+            "audible_speech_end_seconds": self.audible_speech_end_seconds,
+            "uncovered_speech_intervals": self.uncovered_speech_intervals,
+            "truncated": self.truncated,
+            "finish_reason": self.finish_reason,
         }
 
 
@@ -70,8 +122,10 @@ class TranscriptionResult:
     language: str
     warnings: list[str]
     segments: list[TranscriptionSegment] = field(default_factory=list)
+    timestamps: list[TimestampItem] = field(default_factory=list)
     timings: TranscriptionTimings = field(default_factory=TranscriptionTimings)
     generation: GenerationMetrics = field(default_factory=GenerationMetrics)
+    context: ContextApplication = field(default_factory=ContextApplication)
 
 
 class AsrAdapter(Protocol):
@@ -93,7 +147,8 @@ class AsrAdapter(Protocol):
         backend: str,
         language: str,
         context: str,
-        max_new_tokens: int | None,
+        timestamps: str = "none",
+        max_new_tokens: int | None = None,
     ) -> TranscriptionResult:
         ...
 
@@ -105,7 +160,8 @@ class AsrAdapter(Protocol):
         backend: str,
         language: str,
         context: str,
-        max_new_tokens: int | None,
+        timestamps: str = "none",
+        max_new_tokens: int | None = None,
     ) -> list[TranscriptionResult]:
         ...
 @dataclass(frozen=True)

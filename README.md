@@ -13,6 +13,8 @@
 - `docs/validation-2026-07-02-wsl-hf-native.md`：Qwen3-ASR HF native WSL 验收记录。
 - `docs/validation-2026-07-10-wsl-moss.md`：MOSS-Transcribe-Diarize WSL 验收记录。
 - `docs/validation-2026-07-15-wsl-moss-long-form.md`：MOSS 10/30/60/90 分钟原生与自动降级对抗性验收。
+- `docs/validation-2026-09-19-upgrade.md`：细粒度对齐、Context、批量交接与长播客验收边界。
+- `docs/batch-workflow.md`：单条用途配置、批量恢复、重试和结果落盘命令。
 - `prompts/`：给 WSL 服务端代理和 Mac 请求端代理的交接提示词。
 - `asr_server/`：FastAPI 应用、模型注册表、生命周期管理器、异步 job 队列和 ASR 适配器。
 - `tests/`：不依赖 CUDA 的 API、生命周期、临时文件清理、MOSS gate 和 job 行为测试。
@@ -47,9 +49,9 @@ curl --noproxy '*' http://192.168.31.137:18080/health
 
 ## 当前状态
 
-当前代码已经实现 FastAPI 网关、mock 适配器、Qwen3-ASR HF native 真实适配器、可选 MOSS-Transcribe-Diarize 适配器、模型生命周期管理、同步转录、异步转录 job、单 worker FIFO 队列、chunk 级进度、长音频切分与合并、上传大小限制和统一错误信封。
+当前代码已经实现 FastAPI 网关、Qwen3-ASR HF native 适配器、按需 Qwen3 ForcedAligner、可选 MOSS 与 Anchor Replay、真实 Context prompt、用途配置、异步 FIFO job、精简轮询、长音频切分/覆盖检查，以及 Mac 侧批量恢复与原子落盘。
 
-默认模型仍是 `qwen3-asr-1.7b`，默认注册 `qwen3-asr-1.7b` 和 `qwen3-asr-0.6b`。`moss-transcribe-diarize-0.9b` 只有在 WSL 侧完成 MOSS smoke 验收并设置 `ASR_ENABLE_MOSS=1` 后才进入 `/v1/models`；MOSS 的段级说话人和时间段信息只在 `response_format=verbose_json` 中返回，不声明 word/char timestamps、forced alignment 或 vLLM。MOSS `auto` 在已验证的 30 分钟级窗口内走原生 long-form，超过 1801 秒会明确降级为 1800 秒 fixed chunks；客户端必须从响应的 `execution.speaker_scope` 判断 speaker ID 是全局还是 chunk-local。
+默认模型仍是 `qwen3-asr-1.7b`。只有设置 `ASR_ENABLE_QWEN_ALIGNMENT=1` 才在 `/v1/models` 声明 Qwen timestamps/forced alignment；只有完成 MOSS smoke 并设置 `ASR_ENABLE_MOSS=1` 才声明播客模型。MOSS 超过 1801 秒会自动分块，`podcast` 配置启用 Anchor Replay；客户端必须检查 `diarization.status` 与 `speaker_scope`，不能把 mixed/chunk-local 标签冒充整期全局身份。
 
 转录过程中产生的上传文件、解码文件和模型临时音频文件只用于当次请求。同步请求在返回前清理临时文件；异步 job 在完成、失败或取消后清理 job 工作目录，只在内存里按 `ASR_JOB_RESULT_TTL_SECONDS` 保留 job 结果。
 
@@ -114,3 +116,5 @@ curl --noproxy '*' -sS \
 - 长音频或需要前端进度展示时使用 `POST /v1/audio/transcription-jobs`。
 - job 进度只承诺服务端阶段和 chunk 级真实进度，不承诺单个模型 chunk 内部百分比。
 - 客户端必须读取 `/v1/models` 后再决定模型、后端和能力，不要硬编码 MOSS、timestamps、forced alignment 或 streaming。
+
+口播、长播客、带关键词请求、批量清单、恢复/重试和输出目录的可执行命令见 [docs/batch-workflow.md](docs/batch-workflow.md)。

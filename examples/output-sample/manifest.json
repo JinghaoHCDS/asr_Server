@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "sample": true,
+  "items": [
+    {
+      "id": "sample-oral-001-deadbeef0001",
+      "status": "completed",
+      "result_dir": "items/sample-oral-001-deadbeef0001",
+      "note": "synthetic example; not GPU validation"
+    }
+  ]
+}

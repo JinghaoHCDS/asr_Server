@@ -105,8 +105,12 @@ class AsrHttpClient:
             },
         )
 
-    async def get_job(self, job_id: str) -> dict[str, Any]:
-        return await self._request_json("GET", f"/v1/jobs/{quote(job_id, safe='')}")
+    async def get_job(self, job_id: str, *, detail: str = "compact") -> dict[str, Any]:
+        return await self._request_json(
+            "GET",
+            f"/v1/jobs/{quote(job_id, safe='')}",
+            params={"detail": detail},
+        )
 
     async def cancel_job(self, job_id: str) -> dict[str, Any]:
         return await self._request_json("DELETE", f"/v1/jobs/{quote(job_id, safe='')}")
@@ -117,8 +121,8 @@ class AsrHttpClient:
         *,
         model: str | None = None,
         language: str = "auto",
-        response_format: str = "json",
-        timestamps: str = "none",
+        response_format: str | None = None,
+        timestamps: str | None = None,
         backend: str = "auto",
         max_new_tokens: int | None = None,
         context: str = "",
@@ -126,8 +130,11 @@ class AsrHttpClient:
         split_strategy: str = "auto",
         max_chunk_seconds: float | None = None,
         overlap_seconds: float | None = None,
-        preserve_segments: bool = False,
-        speaker_resolution: str = "off",
+        preserve_segments: bool | None = None,
+        speaker_resolution: str | None = None,
+        purpose: str = "transcription",
+        pause_threshold_seconds: float = 0.8,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         path = self.validate_local_audio_path(audio_path)
         data = self._transcription_form(
@@ -144,6 +151,9 @@ class AsrHttpClient:
             overlap_seconds=overlap_seconds,
             preserve_segments=preserve_segments,
             speaker_resolution=speaker_resolution,
+            purpose=purpose,
+            pause_threshold_seconds=pause_threshold_seconds,
+            idempotency_key=idempotency_key,
         )
         with path.open("rb") as audio_file:
             response = await self._request(
@@ -160,8 +170,8 @@ class AsrHttpClient:
         *,
         model: str | None = None,
         language: str = "auto",
-        response_format: str = "json",
-        timestamps: str = "none",
+        response_format: str | None = None,
+        timestamps: str | None = None,
         backend: str = "auto",
         max_new_tokens: int | None = None,
         context: str = "",
@@ -169,8 +179,11 @@ class AsrHttpClient:
         split_strategy: str = "auto",
         max_chunk_seconds: float | None = None,
         overlap_seconds: float | None = None,
-        preserve_segments: bool = False,
-        speaker_resolution: str = "off",
+        preserve_segments: bool | None = None,
+        speaker_resolution: str | None = None,
+        purpose: str = "transcription",
+        pause_threshold_seconds: float = 0.8,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         path = self.validate_local_audio_path(audio_path)
         data = self._transcription_form(
@@ -187,6 +200,9 @@ class AsrHttpClient:
             overlap_seconds=overlap_seconds,
             preserve_segments=preserve_segments,
             speaker_resolution=speaker_resolution,
+            purpose=purpose,
+            pause_threshold_seconds=pause_threshold_seconds,
+            idempotency_key=idempotency_key,
         )
         with path.open("rb") as audio_file:
             response = await self._request(
@@ -240,8 +256,8 @@ class AsrHttpClient:
         *,
         model: str | None,
         language: str,
-        response_format: str,
-        timestamps: str,
+        response_format: str | None,
+        timestamps: str | None,
         backend: str,
         max_new_tokens: int | None,
         context: str,
@@ -249,19 +265,28 @@ class AsrHttpClient:
         split_strategy: str,
         max_chunk_seconds: float | None,
         overlap_seconds: float | None,
-        preserve_segments: bool,
-        speaker_resolution: str,
+        preserve_segments: bool | None,
+        speaker_resolution: str | None,
+        purpose: str,
+        pause_threshold_seconds: float,
+        idempotency_key: str | None,
     ) -> dict[str, str]:
         data = {
             "language": language,
-            "response_format": response_format,
-            "timestamps": timestamps,
             "backend": backend,
             "context": context,
             "split_strategy": split_strategy,
-            "preserve_segments": str(preserve_segments).lower(),
-            "speaker_resolution": speaker_resolution,
+            "purpose": purpose,
+            "pause_threshold_seconds": str(pause_threshold_seconds),
         }
+        if response_format is not None:
+            data["response_format"] = response_format
+        if timestamps is not None:
+            data["timestamps"] = timestamps
+        if preserve_segments is not None:
+            data["preserve_segments"] = str(preserve_segments).lower()
+        if speaker_resolution is not None:
+            data["speaker_resolution"] = speaker_resolution
         if model is not None:
             data["model"] = model
         if max_new_tokens is not None:
@@ -272,6 +297,8 @@ class AsrHttpClient:
             data["max_chunk_seconds"] = str(max_chunk_seconds)
         if overlap_seconds is not None:
             data["overlap_seconds"] = str(overlap_seconds)
+        if idempotency_key is not None:
+            data["idempotency_key"] = idempotency_key
         return data
 
     @staticmethod

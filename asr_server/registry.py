@@ -111,6 +111,7 @@ class ModelCapabilities:
             "speaker_resolution_modes": self.speaker_resolution_modes,
             "speaker_resolution_method": self.speaker_resolution_method,
             "validated_anchor_replay_speakers": self.validated_anchor_replay_speakers,
+            "context_prompt": True,
         }
 
 
@@ -128,14 +129,15 @@ def default_models(
     default_model_id: str = "qwen3-asr-1.7b",
     *,
     enable_moss: bool = False,
+    enable_qwen_alignment: bool = False,
 ) -> dict[str, ModelDefinition]:
     if default_model_id not in {"qwen3-asr-1.7b", "qwen3-asr-0.6b"}:
         raise ValueError("ASR_DEFAULT_MODEL must be qwen3-asr-1.7b or qwen3-asr-0.6b")
     qwen_capabilities = ModelCapabilities(
         transcription=True,
         streaming=False,
-        timestamps=[],
-        forced_alignment=False,
+        timestamps=["auto", "word", "char"] if enable_qwen_alignment else [],
+        forced_alignment=enable_qwen_alignment,
         languages=QWEN_LANGUAGES,
         chinese_dialects=QWEN_CHINESE_DIALECTS,
         backends=["transformers"],

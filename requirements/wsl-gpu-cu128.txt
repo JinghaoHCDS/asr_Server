@@ -3,7 +3,7 @@
 torch==2.11.0
 torchvision==0.26.0
 torchaudio==2.11.0
-transformers @ git+https://github.com/huggingface/transformers@0bc355418bb265136a66c2dedc501066ffbc237d
+transformers @ git+https://github.com/huggingface/transformers@ea31b0c6ab0d1368130b0482aee7293a014c3a38
 accelerate==1.12.0
 safetensors==0.8.0
 soundfile==0.14.0

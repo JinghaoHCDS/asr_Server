@@ -87,7 +87,32 @@ def run_hf_native_transformers(args: argparse.Namespace) -> None:
     apply_request = getattr(processor, "apply_transcription_request", None)
     if not callable(apply_request):
         raise RuntimeError("processor.apply_transcription_request 不可用；停止，避免临时字符串 prompt 绕过")
-    inputs = apply_request(audio=str(args.audio), language=normalize_language(args.language)).to(model.device, model.dtype)
+    request: dict[str, object] = {
+        "audio": str(args.audio),
+        "language": normalize_language(args.language),
+    }
+    if args.prompt:
+        request["prompt"] = args.prompt
+    if normalize_language(args.language) is None:
+        messages: list[dict[str, object]] = []
+        if args.prompt:
+            messages.append(
+                {"role": "system", "content": [{"type": "text", "text": args.prompt}]}
+            )
+        messages.append(
+            {
+                "role": "user",
+                "content": [{"type": "audio", "audio": str(args.audio)}],
+            }
+        )
+        inputs = processor.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+        ).to(model.device, model.dtype)
+    else:
+        inputs = apply_request(**request).to(model.device, model.dtype)
     with torch.inference_mode():
         output_ids = model.generate(**inputs, max_new_tokens=args.max_new_tokens, do_sample=False)
     generated_ids = output_ids[:, inputs["input_ids"].shape[1] :]
@@ -97,6 +122,8 @@ def run_hf_native_transformers(args: argparse.Namespace) -> None:
         language=parsed_language(parsed),
         text=parsed_text(parsed),
     )
+    if args.reject_hallucinated_term and args.reject_hallucinated_term.casefold() in parsed_text(parsed).casefold():
+        raise RuntimeError("negative Context check failed: absent keyword appeared in transcript")
 
 
 def parse_args() -> argparse.Namespace:
@@ -111,6 +138,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda", choices=["cuda", "cuda:0"])
     parser.add_argument("--dtype", default="auto")
     parser.add_argument("--max-new-tokens", type=int, default=256)
+    parser.add_argument("--prompt", default="")
+    parser.add_argument("--reject-hallucinated-term")
     return parser.parse_args()
 
 

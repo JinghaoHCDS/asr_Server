@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "sample": true,
+  "status": "completed",
+  "item": {
+    "id": "sample-oral-001-deadbeef0001",
+    "source": "synthetic-example"
+  },
+  "result": {
+    "purpose": "oral_analysis",
+    "model": "qwen3-asr-1.7b",
+    "duration": 3.0,
+    "text": "这是一段合成样例文本。",
+    "timestamps": [
+      {
+        "text": "这",
+        "start": 1.0,
+        "end": 1.2,
+        "granularity": "char",
+        "source": "qwen3_forced_aligner",
+        "status": "aligned"
+      }
+    ],
+    "context": {
+      "requested": true,
+      "applied": true,
+      "method": "qwen3_asr_system_prompt"
+    },
+    "warnings": [
+      "synthetic_example_not_gpu_validated"
+    ]
+  }
+}

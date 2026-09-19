@@ -306,6 +306,7 @@ async def test_moss_adapter_transcribe_uses_worker_protocol() -> None:
             "audio": b"audio",
             "language": "zh",
             "context": "ctx",
+            "timestamps": "none",
             "max_new_tokens": 2048,
         }
     ]

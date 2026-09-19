@@ -15,9 +15,10 @@ from asr_mcp.errors import AsrGatewayError
 
 Backend = Literal["auto", "transformers", "vllm"]
 ResponseFormat = Literal["json", "verbose_json"]
-Timestamps = Literal["none", "word", "char"]
+Timestamps = Literal["none", "auto", "word", "char"]
 SplitStrategy = Literal["auto", "none", "fixed", "silero", "energy", "vad"]
 SpeakerResolution = Literal["off", "auto", "required"]
+Purpose = Literal["transcription", "oral_analysis", "podcast"]
 
 READ_ONLY = ToolAnnotations(
     readOnlyHint=True,
@@ -70,8 +71,8 @@ def create_mcp_server(client: AsrHttpClient) -> FastMCP:
         path: str,
         model: str | None = None,
         language: str = "auto",
-        response_format: ResponseFormat = "json",
-        timestamps: Timestamps = "none",
+        response_format: ResponseFormat | None = None,
+        timestamps: Timestamps | None = None,
         backend: Backend = "auto",
         max_new_tokens: int | None = None,
         context: str = "",
@@ -79,8 +80,11 @@ def create_mcp_server(client: AsrHttpClient) -> FastMCP:
         split_strategy: SplitStrategy = "auto",
         max_chunk_seconds: float | None = None,
         overlap_seconds: float | None = None,
-        preserve_segments: bool = False,
-        speaker_resolution: SpeakerResolution = "off",
+        preserve_segments: bool | None = None,
+        speaker_resolution: SpeakerResolution | None = None,
+        purpose: Purpose = "transcription",
+        pause_threshold_seconds: float = 0.8,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         """Upload and transcribe a local audio file; long audio may return a queued job."""
         return await _call(
@@ -99,6 +103,9 @@ def create_mcp_server(client: AsrHttpClient) -> FastMCP:
                 overlap_seconds=overlap_seconds,
                 preserve_segments=preserve_segments,
                 speaker_resolution=speaker_resolution,
+                purpose=purpose,
+                pause_threshold_seconds=pause_threshold_seconds,
+                idempotency_key=idempotency_key,
             )
         )
 
@@ -107,8 +114,8 @@ def create_mcp_server(client: AsrHttpClient) -> FastMCP:
         path: str,
         model: str | None = None,
         language: str = "auto",
-        response_format: ResponseFormat = "json",
-        timestamps: Timestamps = "none",
+        response_format: ResponseFormat | None = None,
+        timestamps: Timestamps | None = None,
         backend: Backend = "auto",
         max_new_tokens: int | None = None,
         context: str = "",
@@ -116,8 +123,11 @@ def create_mcp_server(client: AsrHttpClient) -> FastMCP:
         split_strategy: SplitStrategy = "auto",
         max_chunk_seconds: float | None = None,
         overlap_seconds: float | None = None,
-        preserve_segments: bool = False,
-        speaker_resolution: SpeakerResolution = "off",
+        preserve_segments: bool | None = None,
+        speaker_resolution: SpeakerResolution | None = None,
+        purpose: Purpose = "transcription",
+        pause_threshold_seconds: float = 0.8,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         """Upload a local audio file and enqueue a FIFO asynchronous transcription job."""
         return await _call(
@@ -136,13 +146,16 @@ def create_mcp_server(client: AsrHttpClient) -> FastMCP:
                 overlap_seconds=overlap_seconds,
                 preserve_segments=preserve_segments,
                 speaker_resolution=speaker_resolution,
+                purpose=purpose,
+                pause_threshold_seconds=pause_threshold_seconds,
+                idempotency_key=idempotency_key,
             )
         )
 
     @mcp.tool(annotations=READ_ONLY)
-    async def asr_get_job(job_id: str) -> dict[str, Any]:
-        """Get real phase, chunk progress, partial text and final result for a job."""
-        return await _call(client.get_job(job_id))
+    async def asr_get_job(job_id: str, detail: Literal["compact", "full"] = "compact") -> dict[str, Any]:
+        """Get compact progress by default; request full only when fetching the final result."""
+        return await _call(client.get_job(job_id, detail=detail))
 
     @mcp.tool(annotations=DESTRUCTIVE)
     async def asr_cancel_job(job_id: str) -> dict[str, Any]:

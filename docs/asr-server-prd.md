@@ -1,6 +1,8 @@
 # WSL ASR Server PRD
 
-更新时间：2026-07-15
+更新时间：2026-09-19
+
+2026-09 升级说明：本版把细粒度强制对齐、单期长播客全局说话人、逐素材 Context/关键词和 Mac 侧批量落盘纳入正式范围。本文后文若仍出现“初版不要求时间戳”的历史措辞，以本说明及对应能力发现字段为准。
 
 ## 1. 背景
 
@@ -37,7 +39,10 @@ MiMo-V2.5-ASR 不进入初版交付范围，保留为后续扩展候选。
 - 跑通 `qwen3-asr-0.6b` 和 `qwen3-asr-1.7b` 的端到端转录流程。
 - 对每个 Qwen3-ASR 模型跑通所有在 `/v1/models` 中声明支持的推理后端；第一版只声明 `transformers` 后端，`vllm` 后端延后到后续版本。
 - 如果启用 MOSS，跑通 `moss-transcribe-diarize-0.9b` 的 `transformers` 后端，并只把段级 speaker/timestamp 作为 `verbose_json` 的 `segments` 返回。
-- `/v1/models` 只声明已经实现并通过验收的能力；时间戳、强制对齐、流式转写等高级能力不作为初版发布验收前提。
+- Qwen 使用官方 Qwen3 ForcedAligner 按需产生真实细粒度时间信息；不得用均分文字或 chunk/VAD 窗口冒充词/字对齐。
+- Context 与关键词必须进入模型提示，并在响应中报告 `requested/applied/method/truncated/ignored_reason`。
+- Mac 侧按清单批量提交、恢复并原子落盘，供新 Agent 只读取输出目录完成交接。
+- `/v1/models` 只声明已经实现且在当前部署中启用的能力；流式和 vLLM 仍不在本轮范围。
 
 暂不做：
 
@@ -91,9 +96,9 @@ flowchart LR
 
 | 模型 | 模型 ID | 首选用途 | 当前验收能力 | 限制 |
 | --- | --- | --- | --- | --- |
-| Qwen3-ASR 0.6B | `qwen3-asr-0.6b` | 轻量转写、较低显存占用 | 离线转写、语言提示、`transformers` 后端转写 | 质量和复杂音频能力弱于 1.7B；高级能力后续按实测结果逐项打开 |
-| Qwen3-ASR 1.7B | `qwen3-asr-1.7b` | 默认主力模型 | 离线转写、语言提示、`transformers` 后端转写 | 流式、时间戳、强制对齐、vLLM 等高级能力不阻塞初版发布 |
-| MOSS-Transcribe-Diarize | `moss-transcribe-diarize-0.9b` | 可选说话人分离、段级时间段 | 离线转写、`language=auto`、`transformers` 后端、`verbose_json` segments；30 分钟级原生 long-form；opt-in Anchor Replay 已实测 4 人跨 2 块 | 60/90 分钟单次推理会在约 3044 秒处缺尾，因此 `auto` 只在 1801 秒内走原生全局 speaker，超出后降级分块；默认 `speaker_resolution=off` 仍返回 chunk-local，只有显式 `auto|required` 才尝试跨块解析；不声明 word/char timestamps、forced alignment、streaming 或 vLLM |
+| Qwen3-ASR 0.6B | `qwen3-asr-0.6b` | 轻量转写、对齐 smoke | 离线转写、Context prompt、`transformers`、按需官方 forced alignment | 中文实际粒度按 aligner 返回，通常为 CJK 字单元；英文为词；未启用 `ASR_ENABLE_QWEN_ALIGNMENT=1` 时不得声明 timestamps |
+| Qwen3-ASR 1.7B | `qwen3-asr-1.7b` | 默认转写与口播分析 | 离线转写、Context prompt、`transformers`、按需官方 forced alignment | 对齐器额外占用显存并懒加载；不支持 streaming 或 vLLM |
+| MOSS-Transcribe-Diarize | `moss-transcribe-diarize-0.9b` | 长播客匿名说话人 | 离线转写、Context prompt、`language=auto`、`transformers`、段级时间、Anchor Replay 全局标签（上限 4 人） | 超过 1801 秒自动分块，`speaker_resolution=auto|required` 启用 Anchor Replay；无法可靠归属时为 unresolved/mixed；不声明 word/char forced alignment、streaming 或 vLLM |
 
 ## 6. API 设计
 
@@ -290,12 +295,14 @@ Content-Type: `multipart/form-data`
 - `model`：模型 ID，默认 `qwen3-asr-1.7b`。
 - `language`：`auto`、`zh`、`en` 等，默认 `auto`。
 - `response_format`：`json`、`text`、`verbose_json`，默认 `json`。
-- `timestamps`：`none`、`word`、`char`，默认 `none`。
+- `purpose`：`transcription`、`oral_analysis`、`podcast`。`oral_analysis` 默认 `verbose_json + timestamps=auto + preserve_segments=true`；`podcast` 默认 `verbose_json + speaker_resolution=auto` 且不做逐字对齐。显式字段可覆盖配置，但仍按能力发现校验。
+- `timestamps`：`none`、`auto`、`word`、`char`，普通转写默认 `none`。响应必须包含实际 `granularity`、`source` 和 `status`；请求粒度与实际语言粒度不符时返回 warning，不伪造。
 - `backend`：`auto`、`transformers`、`vllm`，默认 `auto`。
 - `temperature`：可选。
 - `max_new_tokens`：可选；使用模型专属限制。Qwen 默认 512、上限 4096；MOSS 未指定时按单次模型输入时长动态计算 `max(2048, ceil(seconds * 12))`，上限 65536。多 chunk Anchor Replay 在调用方未显式指定时额外使用 `24000` 的自动预算下限；显式请求值不受该下限覆盖。
-- `context`：可选；本次转录的领域提示、术语、人名、产品名、项目名等，服务端应限制长度并传给 Qwen adapter。
-- `hotwords`：可选；热词列表，可用逗号分隔字符串或 JSON 数组表达，服务端可合并到 `context`。
+- `context`：可选；本次素材的领域背景。控制字符会规范化，正文上限 3000 字符，总 prompt 上限 4000；超限截断必须可见。
+- `hotwords`：可选；逗号分隔或 JSON 字符串数组，去空、大小写去重，最多 100 个、单项 120 字符。它们是参考词汇而非强制输出清单，不能改变服务权限。
+- `idempotency_key`：异步提交可选；同键、同内容、同参数返回原 job，不同指纹返回 `409 idempotency_conflict`。它只解决提交重试，不等同结果缓存。
 - `speaker_resolution`：`off`、`auto`、`required`，默认 `off`。只对声明支持的 MOSS 模型生效；`auto` 允许部分结果，`required` 在存在冲突、未解析段或候选说话人时返回 `422 speaker_resolution_incomplete`。
 
 返回：
@@ -318,6 +325,10 @@ Content-Type: `multipart/form-data`
 ```
 
 ### 6.8 强制对齐
+
+正式路径是转录接口的 `timestamps=auto|word|char`：先取得原始 ASR 文本，再使用固定 snapshot 的 `Qwen/Qwen3-ForcedAligner-0.6B-hf` 对原音频对齐。对齐结果在分块合并时加回原媒体 offset；静音不会被压缩。`timing.reading_segments` 只是按间隔组织阅读，`semantic_sentence=false`；`pause_candidates` 也只表示声学候选，不代表语义意图。
+
+独立 `POST /v1/audio/alignments` 仍为预留接口，当前不接受调用；不得因为内嵌转录对齐已实现就提供不存在的独立 API 示例。
 
 `POST /v1/audio/alignments`
 
@@ -851,7 +862,7 @@ MCP：
 
 ## 12. 后续路线
 
-当前 WSL 服务端已经实现异步转录 job、FIFO 串行队列、可轮询状态、model-aware MOSS long-form/自动降级、opt-in MOSS Anchor Replay 和 chunk 级真实进度。后续阶段不做 vLLM、WebSocket streaming、MiMo、ForcedAligner、数据库队列、多 worker 并发推理或独立声纹 embedding/聚类，除非 PRD 明确扩展范围并以真实数据证明收益。
+当前 WSL 服务端已经实现异步 job、FIFO 串行队列、可轮询状态、model-aware MOSS long-form/自动降级、opt-in MOSS Anchor Replay、chunk 级真实进度、Qwen 官方 ForcedAligner、Context 应用报告和 Mac 批量恢复/落盘。后续阶段不做 vLLM、WebSocket streaming、MiMo、数据库队列、多 worker 并发推理或独立声纹 embedding/聚类，除非 PRD 再次扩展范围并以真实数据证明收益。
 
 优先级 P0：
 
@@ -871,7 +882,7 @@ MCP：
 - 异步任务。
 - 上传文件大小、时长、格式限制。
 - systemd user service 或 Windows 开机启动。
-- Qwen 时间戳与强制对齐能力，按后端实测结果逐项声明。
+- Qwen 时间戳与强制对齐真实 GPU 验收；仅在通过后设置 `ASR_ENABLE_QWEN_ALIGNMENT=1`。
 
 优先级 P2：
 

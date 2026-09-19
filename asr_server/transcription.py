@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import asyncio
 import threading
 from collections.abc import Awaitable, Callable
@@ -10,10 +9,12 @@ from uuid import uuid4
 
 from asr_server.adapters.base import AudioInput, AudioPath, TranscriptionResult
 from asr_server.audio.merger import ChunkLike, merge_transcription_results
+from asr_server.audio.timing import timing_analysis
 from asr_server.audio.metadata import inspect_audio, inspect_audio_path
 from asr_server.audio.preprocess import normalize_audio_path_to_wav_async, normalize_audio_to_wav
 from asr_server.audio.splitter import PathSplitResult, SplitCancelled, SplitResult, split_audio, split_audio_path
 from asr_server.config import Settings
+from asr_server.context import PreparedContext, prepare_context
 from asr_server.audio.workspace import validate_workspace_limits
 from asr_server.errors import AsrError
 from asr_server.diarization.anchor_replay import AnchorReplaySequence
@@ -22,7 +23,6 @@ from asr_server.lifecycle import ModelLifecycleManager
 from asr_server.registry import Backend
 
 
-MAX_CONTEXT_CHARS = 4000
 SYNC_JOB_THRESHOLD_SECONDS = 600.0
 # Real four-speaker podcast validation showed that a dense 1,740-second body
 # can exhaust MOSS's useful output window after roughly 1,324 seconds even
@@ -70,6 +70,9 @@ class TranscriptionRequest:
     overlap_seconds: float | None
     preserve_segments: bool
     speaker_resolution: str = "off"
+    purpose: str = "transcription"
+    pause_threshold_seconds: float = 0.8
+    idempotency_key: str | None = None
 
     @property
     def generation_config(self) -> GenerationConfig:
@@ -96,40 +99,7 @@ class ValidatedTranscription:
     max_new_tokens: int | None
     execution_policy: ModelExecutionPolicy
     supports_diarization: bool
-
-
-def parse_hotwords(hotwords: str | None) -> list[str]:
-    if hotwords is None or not hotwords.strip():
-        return []
-    stripped = hotwords.strip()
-    if stripped.startswith("["):
-        try:
-            parsed = json.loads(stripped)
-        except json.JSONDecodeError as exc:
-            raise AsrError(400, "bad_request", "hotwords must be a JSON string array or comma-separated string") from exc
-        if not isinstance(parsed, list) or not all(isinstance(item, str) for item in parsed):
-            raise AsrError(400, "bad_request", "hotwords JSON value must be an array of strings")
-        return [item.strip() for item in parsed if item.strip()]
-    return [item.strip() for item in stripped.split(",") if item.strip()]
-
-
-def build_adapter_context(context: str, hotwords: str | None) -> str:
-    parts = []
-    stripped_context = context.strip()
-    if stripped_context:
-        parts.append(stripped_context)
-    normalized_hotwords = parse_hotwords(hotwords)
-    if normalized_hotwords:
-        parts.append("热词提示：" + ", ".join(normalized_hotwords))
-    adapter_context = "\n".join(parts)
-    if len(adapter_context) > MAX_CONTEXT_CHARS:
-        raise AsrError(
-            400,
-            "bad_request",
-            "context exceeds the server context length limit",
-            {"context_chars": len(adapter_context), "max_context_chars": MAX_CONTEXT_CHARS},
-        )
-    return adapter_context
+    context: PreparedContext
 
 
 def validate_transcription_request(
@@ -138,11 +108,15 @@ def validate_transcription_request(
 ) -> ValidatedTranscription:
     if request.response_format not in {"json", "text", "verbose_json"}:
         raise AsrError(400, "bad_request", f"unsupported response_format: {request.response_format}")
-    if request.timestamps not in {"none", "word", "char"}:
+    if request.timestamps not in {"none", "auto", "word", "char"}:
         raise AsrError(400, "bad_request", f"unsupported timestamps value: {request.timestamps}")
     if request.speaker_resolution not in {"off", "auto", "required"}:
         raise AsrError(400, "bad_request", f"unsupported speaker_resolution: {request.speaker_resolution}")
-    selected_model = request.model or manager.default_model_id
+    if request.purpose not in {"transcription", "oral_analysis", "podcast"}:
+        raise AsrError(400, "bad_request", f"unsupported purpose: {request.purpose}")
+    if request.pause_threshold_seconds < 0.2 or request.pause_threshold_seconds > 10.0:
+        raise AsrError(400, "bad_request", "pause_threshold_seconds must be between 0.2 and 10")
+    selected_model = request.model or manager.model_for_purpose(request.purpose)
     runtime = manager.runtime_for(selected_model)
     resolved_backend = manager.resolve_backend(runtime, request.backend)
     if request.language not in runtime.definition.capabilities.languages:
@@ -152,12 +126,22 @@ def validate_transcription_request(
             f"{selected_model} does not support language: {request.language}",
             {"language": request.language},
         )
-    if request.timestamps != "none" and not runtime.definition.capabilities.timestamps:
+    if request.timestamps != "none" and request.timestamps not in runtime.definition.capabilities.timestamps:
+        if request.timestamps == "auto" and runtime.definition.capabilities.timestamps:
+            pass
+        else:
+            raise AsrError(
+                422,
+                "capability_not_supported",
+                f"{selected_model} does not support requested timestamps in this server",
+                {"timestamps": request.timestamps, "supported": runtime.definition.capabilities.timestamps},
+            )
+    if request.purpose == "podcast" and not runtime.definition.capabilities.diarization:
         raise AsrError(
             422,
             "capability_not_supported",
-            f"{selected_model} does not support timestamps in this server",
-            {"timestamps": request.timestamps},
+            f"{selected_model} cannot satisfy purpose=podcast because it lacks diarization",
+            {"required_capability": "diarization"},
         )
     if request.speaker_resolution != "off" and not runtime.definition.capabilities.diarization:
         raise AsrError(
@@ -173,13 +157,15 @@ def validate_transcription_request(
             "speaker resolution requires response_format=verbose_json",
             {"response_format": request.response_format, "recommended_response_format": "verbose_json"},
         )
+    prepared_context = prepare_context(request.context, request.hotwords)
     return ValidatedTranscription(
         selected_model=selected_model,
         resolved_backend=resolved_backend,
-        adapter_context=build_adapter_context(request.context, request.hotwords),
+        adapter_context=prepared_context.prompt,
         max_new_tokens=runtime.definition.execution_policy.validate_max_new_tokens(request.max_new_tokens),
         execution_policy=runtime.definition.execution_policy,
         supports_diarization=runtime.definition.capabilities.diarization,
+        context=prepared_context,
     )
 
 
@@ -252,7 +238,7 @@ async def run_transcription(
         effective_before_chunk = native_before_chunk
     resolved_backend, chunk_results, timings = await manager.transcribe_chunks(
         [chunk.audio for chunk in split.chunks],
-        model_id=request.model,
+        model_id=checked.selected_model,
         backend=request.backend,
         language=request.language,
         timestamps=request.timestamps,
@@ -278,7 +264,21 @@ async def run_transcription(
         timings=timings,
         speaker_scope="global" if speaker_scope == "global" else "chunk",
     )
-    warnings = _warnings(result.warnings, split.warnings, resolved_max_new_tokens, request.max_new_tokens)
+    warnings = _warnings(
+        result.warnings,
+        [*split.warnings, *checked.context.warnings],
+        resolved_max_new_tokens,
+        request.max_new_tokens,
+    )
+    timing = timing_analysis(
+        result.timestamps,
+        transcript=result.text,
+        duration=result.duration,
+        chunks=split.chunks,
+        speech_intervals=getattr(split, "speech_intervals", ()),
+        vad_based_chunks=split.strategy in {"energy", "silero"},
+        pause_threshold_seconds=request.pause_threshold_seconds,
+    )
     return transcription_payload(
         id_=f"tr_{uuid4().hex}",
         selected_model=checked.selected_model,
@@ -289,11 +289,15 @@ async def run_transcription(
         duration=result.duration,
         chunks=result.chunks,
         segments=result.segments if request.response_format == "verbose_json" else [],
+        timestamps=result.timestamps,
         timings=result.timings.to_api(),
         warnings=warnings,
         execution=plan.to_api(speaker_scope=speaker_scope),
         generation=_generation_payload(split, chunk_results, resolved_max_new_tokens),
         diarization=None,
+        context=_context_payload(checked.context, chunk_results),
+        timing=timing,
+        purpose=request.purpose,
     )
 
 
@@ -411,7 +415,7 @@ async def run_transcription_path(
         anchor_sequence = AnchorReplaySequence(split.chunks)
         resolved_backend, chunk_results, timings = await manager.transcribe_sequence(
             anchor_sequence,
-            model_id=request.model,
+            model_id=checked.selected_model,
             backend=request.backend,
             language=request.language,
             timestamps=request.timestamps,
@@ -423,7 +427,7 @@ async def run_transcription_path(
     else:
         resolved_backend, chunk_results, timings = await manager.transcribe_chunks(
             audio_inputs,
-            model_id=request.model,
+            model_id=checked.selected_model,
             backend=request.backend,
             language=request.language,
             timestamps=request.timestamps,
@@ -466,7 +470,21 @@ async def run_transcription_path(
             "mixed" if speaker_scope == "mixed" else "global" if speaker_scope == "global" else "chunk"
         ),
     )
-    warnings = _warnings(result.warnings, split.warnings, resolved_max_new_tokens, request.max_new_tokens)
+    warnings = _warnings(
+        result.warnings,
+        [*split.warnings, *checked.context.warnings],
+        resolved_max_new_tokens,
+        request.max_new_tokens,
+    )
+    timing = timing_analysis(
+        result.timestamps,
+        transcript=result.text,
+        duration=result.duration,
+        chunks=split.chunks,
+        speech_intervals=getattr(split, "speech_intervals", ()),
+        vad_based_chunks=split.strategy in {"energy", "silero"},
+        pause_threshold_seconds=request.pause_threshold_seconds,
+    )
     return transcription_payload(
         id_=f"tr_{uuid4().hex}",
         selected_model=checked.selected_model,
@@ -477,11 +495,15 @@ async def run_transcription_path(
         duration=result.duration,
         chunks=result.chunks,
         segments=result.segments if request.response_format == "verbose_json" else [],
+        timestamps=result.timestamps,
         timings=result.timings.to_api(),
         warnings=warnings,
         execution=plan.to_api(speaker_scope=speaker_scope),
         generation=_generation_payload(split, chunk_results, resolved_max_new_tokens),
         diarization=diarization,
+        context=_context_payload(checked.context, chunk_results),
+        timing=timing,
+        purpose=request.purpose,
     )
 
 
@@ -496,11 +518,15 @@ def transcription_payload(
     duration: float,
     chunks: list[dict[str, object]],
     segments: list[dict[str, object]],
+    timestamps: list[dict[str, object]],
     timings: dict[str, float],
     warnings: list[str],
     execution: dict[str, object],
     generation: dict[str, object],
     diarization: dict[str, object] | None,
+    context: dict[str, object],
+    timing: dict[str, object],
+    purpose: str,
 ) -> dict[str, object]:
     payload: dict[str, object] = {
         "id": id_,
@@ -509,7 +535,7 @@ def transcription_payload(
         "language": language,
         "text": text,
         "duration": duration,
-        "timestamps": [],
+        "timestamps": timestamps,
         "segments": segments,
         "split": split.summary(),
         "chunks": chunks,
@@ -518,6 +544,9 @@ def transcription_payload(
         "warnings": warnings,
         "execution": execution,
         "generation": generation,
+        "context": context,
+        "timing": timing,
+        "purpose": purpose,
     }
     if diarization is not None:
         payload["diarization"] = diarization
@@ -633,6 +662,16 @@ def _generation_payload(
         if coverage_end is not None and split.metadata.duration_seconds > 0
         else None
     )
+    audible_ends = [
+        chunk.start + result.generation.audible_speech_end_seconds
+        for chunk, result in zip(chunks, results, strict=True)
+        if result.generation.audible_speech_end_seconds is not None
+    ]
+    uncovered_speech = [
+        result.generation.uncovered_speech_intervals
+        for result in results
+        if result.generation.uncovered_speech_intervals is not None
+    ]
     return {
         "prompt_tokens": sum(prompt_values) if prompt_values else None,
         "generated_tokens": sum(generated_values) if generated_values else None,
@@ -640,8 +679,34 @@ def _generation_payload(
         "peak_vram_allocated_mb": max(peak_values) if peak_values else None,
         "segment_coverage_end_seconds": coverage_end,
         "segment_coverage_ratio": coverage_ratio,
+        "audible_speech_end_seconds": max(audible_ends, default=None),
+        "uncovered_speech_intervals": sum(uncovered_speech) if uncovered_speech else None,
+        "coverage_is_not_accuracy": True,
         "invocation_count": len(results),
-        "truncated": False,
+        "truncated": any(item.generation.truncated for item in results),
+        "finish_reasons": list(
+            dict.fromkeys(
+                item.generation.finish_reason
+                for item in results
+                if item.generation.finish_reason is not None
+            )
+        ),
+    }
+
+
+def _context_payload(prepared: PreparedContext, results: list[TranscriptionResult]) -> dict[str, object]:
+    applications = [result.context for result in results]
+    applied = prepared.requested and bool(applications) and all(item.applied for item in applications)
+    methods = list(dict.fromkeys(item.method for item in applications if item.method is not None))
+    ignored_reasons = list(
+        dict.fromkeys(item.ignored_reason for item in applications if item.ignored_reason is not None)
+    )
+    return {
+        **prepared.request_summary(),
+        "applied": applied,
+        "method": methods[0] if len(methods) == 1 else methods or None,
+        "ignored_reason": ignored_reasons[0] if len(ignored_reasons) == 1 else ignored_reasons or None,
+        "invocation_count": len(applications),
     }
 
 

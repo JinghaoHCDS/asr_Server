@@ -28,6 +28,17 @@ class TextResult:
     language = "en"
 
 
+class EmptyTextResult:
+    text = ""
+    language = "en"
+
+
+class EmptyTextModel:
+    def transcribe(self, **kwargs: object) -> list[EmptyTextResult]:
+        del kwargs
+        return [EmptyTextResult()]
+
+
 class RecordingModel:
     def __init__(self, calls: list[str]) -> None:
         self.calls = calls
@@ -124,9 +135,21 @@ async def test_qwen_load_uses_hf_native_transformers_without_qwen_asr(monkeypatc
             calls.append(("processor_revision", revision))
             return cls()
 
-        def apply_transcription_request(self, *, audio: str, language: str | None) -> FakeHfInputs:
+        def apply_transcription_request(
+            self,
+            *,
+            audio: str,
+            language: str | None,
+            prompt: str | None = None,
+        ) -> FakeHfInputs:
             calls.append(("audio", audio))
             calls.append(("language", language))
+            calls.append(("prompt", prompt))
+            return FakeHfInputs(input_ids=SimpleNamespace(shape=[1, 2]))
+
+        def apply_chat_template(self, messages: object, **kwargs: object) -> FakeHfInputs:
+            calls.append(("messages", messages))
+            calls.append(("chat_template_kwargs", kwargs))
             return FakeHfInputs(input_ids=SimpleNamespace(shape=[1, 2]))
 
         def decode(self, generated_ids: object, return_format: str) -> list[dict[str, str]]:
@@ -195,7 +218,16 @@ async def test_qwen_load_uses_hf_native_transformers_without_qwen_asr(monkeypatc
 
     assert result.text == "hello"
     assert result.language == "English"
-    assert result.warnings == ["context is not applied by the HF native transcription helper"]
+    assert result.warnings == ["qwen_auto_language_uses_chat_template_generation_prompt"]
+    assert result.context.applied is True
+    assert result.context.method == "qwen3_asr_system_prompt"
+    messages = next(value for key, value in calls if key == "messages")
+    assert isinstance(messages, list)
+    assert messages[0] == {
+        "role": "system",
+        "content": [{"type": "text", "text": "domain terms"}],
+    }
+    assert "qwen_auto_language_uses_chat_template_generation_prompt" in result.warnings
     assert ("processor_repo", "Qwen/Qwen3-ASR-0.6B-hf") in calls
     assert ("model_repo", "Qwen/Qwen3-ASR-0.6B-hf") in calls
     assert ("dtype", "bf16") in calls
@@ -258,7 +290,25 @@ async def test_qwen_transcribe_rejects_empty_results() -> None:
             max_new_tokens=None,
         )
 
-    assert exc_info.value.code == "inference_failed"
+    assert exc_info.value.code == "empty_transcription"
+
+
+async def test_qwen_batch_distinguishes_empty_transcription_from_inference_failure() -> None:
+    adapter = _QwenWorkerBackend("qwen3-asr-0.6b")
+    adapter._model = EmptyTextModel()
+
+    with pytest.raises(AsrError) as exc_info:
+        await adapter.transcribe_batch(
+            [b"audio"],
+            model_id="qwen3-asr-0.6b",
+            backend="transformers",
+            language="auto",
+            context="",
+            max_new_tokens=None,
+        )
+
+    assert exc_info.value.status_code == 422
+    assert exc_info.value.code == "empty_transcription"
 
 
 async def test_qwen_transcribe_uses_inference_mode_when_torch_is_available(
@@ -343,6 +393,7 @@ async def test_qwen_adapter_transcribe_uses_worker_protocol() -> None:
             "audio": b"audio",
             "language": "auto",
             "context": "ctx",
+            "timestamps": "none",
             "max_new_tokens": 128,
         }
     ]

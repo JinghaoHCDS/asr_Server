@@ -30,6 +30,7 @@ class MergedTranscription:
     timings: TranscriptionTimings
     chunks: list[dict[str, object]]
     segments: list[dict[str, object]]
+    timestamps: list[dict[str, object]]
 
 
 def merge_transcription_results(
@@ -56,6 +57,7 @@ def merge_transcription_results(
         timestamp_source="vad_chunk_window",
     )
     segments = _merged_segments(chunks, results, speaker_scope=speaker_scope)
+    timestamps = _merged_timestamps(chunks, results)
     warnings = _unique_warnings(results)
     if (
         len(chunks) > 1
@@ -76,6 +78,7 @@ def merge_transcription_results(
         timings=timings,
         chunks=_chunk_payload(chunks, results, document) if preserve_segments else [],
         segments=segments,
+        timestamps=timestamps,
     )
 
 
@@ -117,8 +120,22 @@ def _chunk_payload(
                         "end": chunk.start + item.end,
                         "speaker": item.speaker,
                         "text": item.text,
+                        **({"source_speaker": item.source_speaker} if item.source_speaker is not None else {}),
+                        **(
+                            {"speaker_resolution": item.speaker_resolution}
+                            if item.speaker_resolution is not None
+                            else {}
+                        ),
                     }
                     for item in result.segments
+                ],
+                "timestamps": [
+                    {
+                        **item.to_api(),
+                        "start": chunk.start + item.start,
+                        "end": chunk.start + item.end,
+                    }
+                    for item in result.timestamps
                 ],
             }
         )
@@ -173,3 +190,78 @@ def _merged_segments(
                 payload["speaker_resolution"] = segment.speaker_resolution
             segments.append(payload)
     return segments
+
+
+def _merged_timestamps(
+    chunks: Sequence[ChunkLike],
+    results: list[TranscriptionResult],
+) -> list[dict[str, object]]:
+    items: list[dict[str, object]] = []
+    for chunk_position, (chunk, result) in enumerate(zip(chunks, results, strict=True)):
+        for timestamp_item in result.timestamps:
+            absolute_start = chunk.start + timestamp_item.start
+            absolute_end = chunk.start + timestamp_item.end
+            items.append(
+                {
+                    **timestamp_item.to_api(),
+                    "start": absolute_start,
+                    "end": absolute_end,
+                    "chunk_index": chunk.index,
+                    "_chunk_position": chunk_position,
+                }
+            )
+    items.sort(key=lambda payload: (_as_float(payload["start"]), _as_float(payload["end"])))
+    deduped: list[dict[str, object]] = []
+    for payload_item in items:
+        duplicate_index = _overlap_duplicate_index(payload_item, deduped, chunks)
+        if duplicate_index is None:
+            deduped.append(payload_item)
+            continue
+        existing = deduped[duplicate_index]
+        left_position = min(_as_int(existing["_chunk_position"]), _as_int(payload_item["_chunk_position"]))
+        right_position = max(_as_int(existing["_chunk_position"]), _as_int(payload_item["_chunk_position"]))
+        boundary = (chunks[left_position].end + chunks[right_position].start) / 2
+        existing_midpoint = (_as_float(existing["start"]) + _as_float(existing["end"])) / 2
+        item_midpoint = (_as_float(payload_item["start"]) + _as_float(payload_item["end"])) / 2
+        if abs(item_midpoint - boundary) < abs(existing_midpoint - boundary):
+            deduped[duplicate_index] = payload_item
+    for payload_item in deduped:
+        payload_item.pop("_chunk_position", None)
+    deduped.sort(key=lambda payload: (_as_float(payload["start"]), _as_float(payload["end"])))
+    return deduped
+
+
+def _overlap_duplicate_index(
+    candidate: dict[str, object],
+    existing_items: list[dict[str, object]],
+    chunks: Sequence[ChunkLike],
+) -> int | None:
+    candidate_position = _as_int(candidate["_chunk_position"])
+    candidate_midpoint = (_as_float(candidate["start"]) + _as_float(candidate["end"])) / 2
+    for index in range(len(existing_items) - 1, -1, -1):
+        existing = existing_items[index]
+        existing_position = _as_int(existing["_chunk_position"])
+        if abs(candidate_position - existing_position) != 1:
+            continue
+        if str(existing["text"]).casefold() != str(candidate["text"]).casefold():
+            continue
+        left_position = min(candidate_position, existing_position)
+        right_position = max(candidate_position, existing_position)
+        overlap_start = max(chunks[left_position].start, chunks[right_position].start)
+        overlap_end = min(chunks[left_position].end, chunks[right_position].end)
+        existing_midpoint = (_as_float(existing["start"]) + _as_float(existing["end"])) / 2
+        if overlap_start <= candidate_midpoint <= overlap_end and overlap_start <= existing_midpoint <= overlap_end:
+            return index
+    return None
+
+
+def _as_float(value: object) -> float:
+    if isinstance(value, int | float | str):
+        return float(value)
+    raise TypeError(f"expected numeric value, got {type(value).__name__}")
+
+
+def _as_int(value: object) -> int:
+    if isinstance(value, int | str):
+        return int(value)
+    raise TypeError(f"expected integer value, got {type(value).__name__}")

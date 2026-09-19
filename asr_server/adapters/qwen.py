@@ -5,13 +5,22 @@ import importlib
 import logging
 import os
 import signal
+import inspect
 from collections.abc import Callable
 from dataclasses import dataclass
 from multiprocessing.connection import Connection
 from time import perf_counter
 from typing import Any
 
-from asr_server.adapters.base import AudioInput, TranscriptionResult, TranscriptionSegment, TranscriptionTimings
+from asr_server.adapters.base import (
+    AudioInput,
+    ContextApplication,
+    GenerationMetrics,
+    TimestampItem,
+    TranscriptionResult,
+    TranscriptionSegment,
+    TranscriptionTimings,
+)
 from asr_server.errors import AsrError
 from asr_server.workers.audio import audio_duration_seconds, materialized_audio_path
 from asr_server.workers.transport import ProcessRpcTransport
@@ -25,12 +34,14 @@ MODEL_REVISIONS = {
     "qwen3-asr-0.6b": "6aa69c382e2b426eee1f5870d4c95859a74b6445",
     "qwen3-asr-1.7b": "057a3b044fcd31c433e7971ab40d68d20e7eae6d",
 }
+ALIGNER_REPO = "Qwen/Qwen3-ForcedAligner-0.6B-hf"
+ALIGNER_REVISION = "c07281df297b9905d24a508279258cccf987a064"
 logger = logging.getLogger(__name__)
 
 
-def _qwen_worker_main(conn: Connection, model_id: str) -> None:
+def _qwen_worker_main(conn: Connection, model_id: str, enable_alignment: bool) -> None:
     signal.signal(signal.SIGINT, signal.SIG_IGN)
-    backend = _QwenWorkerBackend(model_id)
+    backend = _QwenWorkerBackend(model_id, enable_alignment=enable_alignment)
     try:
         while True:
             request = conn.recv()
@@ -59,6 +70,7 @@ def _qwen_worker_main(conn: Connection, model_id: str) -> None:
                             backend=backend.loaded_backend or "transformers",
                             language=str(request["language"]),
                             context=str(request["context"]),
+                            timestamps=str(request.get("timestamps", "none")),
                             max_new_tokens=_optional_int(request.get("max_new_tokens")),
                         )
                     )
@@ -72,6 +84,7 @@ def _qwen_worker_main(conn: Connection, model_id: str) -> None:
                             backend=backend.loaded_backend or "transformers",
                             language=str(request["language"]),
                             context=str(request["context"]),
+                            timestamps=str(request.get("timestamps", "none")),
                             max_new_tokens=_optional_int(request.get("max_new_tokens")),
                         )
                     )
@@ -124,6 +137,7 @@ def _result_to_payload(result: TranscriptionResult) -> dict[str, object]:
         "language": result.language,
         "warnings": result.warnings,
         "segments": [segment.to_api() for segment in result.segments],
+        "timestamps": [item.to_api() for item in result.timestamps],
         "timings": {
             "total_ms": result.timings.total_ms,
             "load_ms": result.timings.load_ms,
@@ -131,11 +145,15 @@ def _result_to_payload(result: TranscriptionResult) -> dict[str, object]:
             "inference_ms": result.timings.inference_ms,
             "postprocess_ms": result.timings.postprocess_ms,
         },
+        "generation": result.generation.to_api(),
+        "context": result.context.to_api(),
     }
 
 
 def _result_from_payload(payload: Any) -> TranscriptionResult:
     timings = payload.get("timings", {})
+    generation = payload.get("generation", {})
+    context = payload.get("context", {})
     return TranscriptionResult(
         text=str(payload["text"]),
         duration=float(payload["duration"]),
@@ -147,8 +165,29 @@ def _result_from_payload(payload: Any) -> TranscriptionResult:
                 end=float(segment["end"]),
                 speaker=str(segment["speaker"]) if segment.get("speaker") is not None else None,
                 text=str(segment["text"]),
+                source_speaker=(
+                    str(segment["source_speaker"])
+                    if segment.get("source_speaker") is not None
+                    else None
+                ),
+                speaker_resolution=(
+                    str(segment["speaker_resolution"])
+                    if segment.get("speaker_resolution") is not None
+                    else None
+                ),
             )
             for segment in payload.get("segments", [])
+        ],
+        timestamps=[
+            TimestampItem(
+                text=str(item["text"]),
+                start=float(item["start"]),
+                end=float(item["end"]),
+                granularity=str(item["granularity"]),
+                source=str(item.get("source", "qwen3_forced_aligner")),
+                status=str(item.get("status", "aligned")),
+            )
+            for item in payload.get("timestamps", [])
         ],
         timings=TranscriptionTimings(
             total_ms=float(timings.get("total_ms", 0.0)),
@@ -157,7 +196,39 @@ def _result_from_payload(payload: Any) -> TranscriptionResult:
             inference_ms=float(timings.get("inference_ms", 0.0)),
             postprocess_ms=float(timings.get("postprocess_ms", 0.0)),
         ),
+        generation=GenerationMetrics(
+            prompt_tokens=_optional_int(generation.get("prompt_tokens")),
+            generated_tokens=_optional_int(generation.get("generated_tokens")),
+            max_new_tokens=_optional_int(generation.get("max_new_tokens")),
+            peak_vram_allocated_mb=_optional_float(generation.get("peak_vram_allocated_mb")),
+            segment_coverage_end_seconds=_optional_float(generation.get("segment_coverage_end_seconds")),
+            segment_coverage_ratio=_optional_float(generation.get("segment_coverage_ratio")),
+            audible_speech_end_seconds=_optional_float(generation.get("audible_speech_end_seconds")),
+            uncovered_speech_intervals=_optional_int(generation.get("uncovered_speech_intervals")),
+            truncated=bool(generation.get("truncated", False)),
+            finish_reason=str(generation["finish_reason"]) if generation.get("finish_reason") is not None else None,
+        ),
+        context=ContextApplication(
+            requested=bool(context.get("requested", False)),
+            applied=bool(context.get("applied", False)),
+            method=str(context["method"]) if context.get("method") is not None else None,
+            input_chars=int(context.get("input_chars", 0)),
+            used_chars=int(context.get("used_chars", 0)),
+            hotword_count=int(context.get("hotword_count", 0)),
+            truncated=bool(context.get("truncated", False)),
+            ignored_reason=str(context["ignored_reason"]) if context.get("ignored_reason") is not None else None,
+        ),
     )
+
+
+def _optional_float(value: object) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, int | float):
+        return float(value)
+    if isinstance(value, str):
+        return float(value)
+    raise TypeError(f"expected optional float value, got {type(value).__name__}")
 
 
 def _error_to_payload(error: AsrError) -> dict[str, object]:
@@ -176,6 +247,7 @@ class QwenAsrAdapter:
         self,
         model_id: str,
         *,
+        enable_alignment: bool = False,
         startup_timeout_seconds: float = 30.0,
         load_timeout_seconds: float = 900.0,
         inference_timeout_seconds: float = 3600.0,
@@ -189,7 +261,7 @@ class QwenAsrAdapter:
         self._transport = ProcessRpcTransport(
             name=f"Qwen {model_id}",
             target=_qwen_worker_main,
-            target_args=(model_id,),
+            target_args=(model_id, enable_alignment),
             startup_timeout_seconds=startup_timeout_seconds,
         )
 
@@ -224,7 +296,8 @@ class QwenAsrAdapter:
         backend: str,
         language: str,
         context: str,
-        max_new_tokens: int | None,
+        timestamps: str = "none",
+        max_new_tokens: int | None = None,
     ) -> TranscriptionResult:
         del model_id, backend
         payload = self._request(
@@ -233,6 +306,7 @@ class QwenAsrAdapter:
             audio=audio,
             language=language,
             context=context,
+            timestamps=timestamps,
             max_new_tokens=max_new_tokens,
         )
         return _result_from_payload(payload)
@@ -245,7 +319,8 @@ class QwenAsrAdapter:
         backend: str,
         language: str,
         context: str,
-        max_new_tokens: int | None,
+        timestamps: str = "none",
+        max_new_tokens: int | None = None,
     ) -> list[TranscriptionResult]:
         del model_id, backend
         payload = self._request(
@@ -254,6 +329,7 @@ class QwenAsrAdapter:
             audio_chunks=audio_chunks,
             language=language,
             context=context,
+            timestamps=timestamps,
             max_new_tokens=max_new_tokens,
         )
         return [_result_from_payload(item) for item in payload]
@@ -265,10 +341,13 @@ class QwenAsrAdapter:
 class _QwenWorkerBackend:
     """In-process Qwen3-ASR backend used only inside the worker process."""
 
-    def __init__(self, model_id: str) -> None:
+    def __init__(self, model_id: str, *, enable_alignment: bool = False) -> None:
         self.model_id = model_id
         self.loaded_backend: str | None = None
         self._model: Any | None = None
+        self._enable_alignment = enable_alignment
+        self._aligner_processor: Any | None = None
+        self._aligner_model: Any | None = None
 
     async def load(self, backend: str, device: str, dtype: str, max_new_tokens: int | None = None) -> None:
         if device not in {"cuda", "cuda:0"}:
@@ -300,11 +379,18 @@ class _QwenWorkerBackend:
     async def unload(self, cuda_empty_cache: bool) -> None:
         model = self._model
         self._model = None
+        aligner_model = self._aligner_model
+        self._aligner_model = None
+        self._aligner_processor = None
         self.loaded_backend = None
         if model is not None:
             self._move_model_to_cpu(model)
             self._close_model(model)
             del model
+        if aligner_model is not None:
+            self._move_model_to_cpu(aligner_model)
+            self._close_model(aligner_model)
+            del aligner_model
         gc.collect()
         if cuda_empty_cache:
             self._release_cuda_cache()
@@ -317,7 +403,8 @@ class _QwenWorkerBackend:
         backend: str,
         language: str,
         context: str,
-        max_new_tokens: int | None,
+        timestamps: str = "none",
+        max_new_tokens: int | None = None,
     ) -> TranscriptionResult:
         del model_id, backend
         model = self._model
@@ -333,6 +420,8 @@ class _QwenWorkerBackend:
                 transcribe_kwargs["max_new_tokens"] = max_new_tokens
             try:
                 results = self._transcribe_model(model, transcribe_kwargs)
+            except AsrError:
+                raise
             except Exception as exc:
                 raise self._map_qwen_exception(exc, phase="inference", model_id=self.model_id) from exc
             inference_ms = (perf_counter() - inference_started) * 1000
@@ -340,17 +429,35 @@ class _QwenWorkerBackend:
             first = self._first_result(results)
             text = self._result_text(first)
             if not text.strip():
-                raise AsrError(503, "inference_failed", "Qwen returned an empty transcription result")
+                raise AsrError(422, "empty_transcription", "Qwen returned an empty transcription result")
             detected_language = self._result_language(first) or ("zh" if language == "auto" else language)
+            timestamp_items: list[TimestampItem] = []
+            alignment_warnings: list[str] = []
+            if timestamps != "none":
+                timestamp_items, alignment_warnings = self._align(
+                    str(audio_path),
+                    text,
+                    detected_language,
+                    requested_granularity=timestamps,
+                )
             postprocess_ms = (perf_counter() - postprocess_started) * 1000
             return TranscriptionResult(
                 text=text,
                 duration=audio_duration_seconds(audio),
                 language=detected_language,
-                warnings=self._result_warnings(first),
+                warnings=[*self._result_warnings(first), *alignment_warnings],
+                timestamps=timestamp_items,
                 timings=TranscriptionTimings(
                     inference_ms=inference_ms,
                     postprocess_ms=postprocess_ms,
+                ),
+                generation=self._result_generation(first),
+                context=ContextApplication(
+                    requested=bool(context),
+                    applied=bool(context),
+                    method="qwen3_asr_system_prompt" if context else None,
+                    input_chars=len(context),
+                    used_chars=len(context),
                 ),
             )
     async def transcribe_batch(
@@ -361,12 +468,15 @@ class _QwenWorkerBackend:
         backend: str,
         language: str,
         context: str,
-        max_new_tokens: int | None,
+        timestamps: str = "none",
+        max_new_tokens: int | None = None,
     ) -> list[TranscriptionResult]:
         del model_id, backend
         model = self._model
         if model is None:
             raise AsrError(409, "model_loading", "Qwen model is not loaded")
+        if timestamps != "none":
+            raise AsrError(422, "capability_not_supported", "timestamp alignment requires single-chunk adapter calls")
         # The HF helper does not provide a proven GPU-safe batch path here.
         # Process one descriptor at a time so only one bounded chunk is materialized.
         results = []
@@ -386,6 +496,8 @@ class _QwenWorkerBackend:
                             },
                         )[0]
                     )
+        except AsrError:
+            raise
         except Exception as exc:
             raise self._map_qwen_exception(exc, phase="inference", model_id=self.model_id) from exc
         inference_ms = (perf_counter() - inference_started) * 1000
@@ -403,6 +515,14 @@ class _QwenWorkerBackend:
                     duration=audio_duration_seconds(audio),
                     language=self._result_language(result) or ("zh" if language == "auto" else language),
                     warnings=self._result_warnings(result),
+                    generation=self._result_generation(result),
+                    context=ContextApplication(
+                        requested=bool(context),
+                        applied=bool(context),
+                        method="qwen3_asr_system_prompt" if context else None,
+                        input_chars=len(context),
+                        used_chars=len(context),
+                    ),
                     timings=TranscriptionTimings(
                         inference_ms=inference_ms / len(audio_chunks) if audio_chunks else 0.0,
                         postprocess_ms=0.0,
@@ -419,6 +539,9 @@ class _QwenWorkerBackend:
                         duration=result.duration,
                         language=result.language,
                         warnings=result.warnings,
+                        timestamps=result.timestamps,
+                        generation=result.generation,
+                        context=result.context,
                         timings=TranscriptionTimings(
                             inference_ms=result.timings.inference_ms,
                             postprocess_ms=per_chunk_postprocess_ms,
@@ -561,7 +684,7 @@ class _QwenWorkerBackend:
     def _non_empty_text(self, result: Any) -> str:
         text = self._result_text(result)
         if not text.strip():
-            raise AsrError(503, "inference_failed", "Qwen returned an empty transcription result")
+            raise AsrError(422, "empty_transcription", "Qwen returned an empty transcription result")
         return text
 
     def _result_language(self, result: Any) -> str:
@@ -576,11 +699,104 @@ class _QwenWorkerBackend:
             return [str(warnings)]
         return [str(warning) for warning in warnings]
 
+    def _result_generation(self, result: Any) -> GenerationMetrics:
+        generation = getattr(result, "generation", None)
+        return generation if isinstance(generation, GenerationMetrics) else GenerationMetrics()
+
+    def _align(
+        self,
+        audio_path: str,
+        transcript: str,
+        language: str,
+        *,
+        requested_granularity: str,
+    ) -> tuple[list[TimestampItem], list[str]]:
+        if not self._enable_alignment:
+            raise AsrError(
+                422,
+                "capability_not_supported",
+                "Qwen forced alignment is not enabled in this deployment",
+            )
+        self._ensure_aligner_loaded()
+        processor = self._aligner_processor
+        model = self._aligner_model
+        if processor is None or model is None:
+            raise AsrError(503, "model_dependency_unavailable", "Qwen forced aligner failed to load")
+        try:
+            inputs, word_lists = processor.prepare_forced_aligner_inputs(
+                audio=audio_path,
+                transcript=transcript,
+                language=language,
+            )
+            inputs = inputs.to(model.device, model.dtype)
+            inference_mode = getattr(self._assert_cuda_torch(), "inference_mode")
+            with inference_mode():
+                outputs = model(**inputs)
+            aligned_batches = processor.decode_forced_alignment(
+                logits=outputs.logits,
+                input_ids=inputs["input_ids"],
+                word_lists=word_lists,
+                timestamp_token_id=model.config.timestamp_token_id,
+            )
+            aligned = aligned_batches[0]
+        except AsrError:
+            raise
+        except Exception as exc:
+            raise AsrError(
+                422,
+                "alignment_failed",
+                "Qwen forced alignment failed",
+                {"error_type": type(exc).__name__, "message": str(exc)[-500:]},
+            ) from exc
+        if not aligned:
+            raise AsrError(422, "alignment_failed", "Qwen forced aligner returned no timestamp items")
+        actual_granularity = "char" if _is_character_alignment(aligned) else "word"
+        warnings = []
+        if requested_granularity not in {"auto", actual_granularity}:
+            warnings.append(
+                f"alignment_granularity_adjusted:requested={requested_granularity}:actual={actual_granularity}"
+            )
+        items: list[TimestampItem] = []
+        previous_end = 0.0
+        for raw in aligned:
+            text = str(raw.get("text", "")).strip()
+            start = float(raw["start_time"])
+            end = float(raw["end_time"])
+            if not text or start < 0 or end < start or start + 0.001 < previous_end:
+                raise AsrError(
+                    422,
+                    "alignment_failed",
+                    "Qwen forced aligner returned invalid or non-monotonic timestamps",
+                )
+            items.append(TimestampItem(text=text, start=start, end=end, granularity=actual_granularity))
+            previous_end = end
+        return items, warnings
+
+    def _ensure_aligner_loaded(self) -> None:
+        if self._aligner_model is not None and self._aligner_processor is not None:
+            return
+        try:
+            transformers = importlib.import_module("transformers")
+            processor_cls = getattr(transformers, "AutoProcessor")
+            model_cls = getattr(transformers, "AutoModelForTokenClassification")
+            processor = processor_cls.from_pretrained(ALIGNER_REPO, revision=ALIGNER_REVISION)
+            asr_wrapper = self._model
+            if asr_wrapper is None:
+                raise RuntimeError("ASR model is not loaded")
+            device = asr_wrapper.model.device
+            dtype = asr_wrapper.model.dtype
+            model = model_cls.from_pretrained(ALIGNER_REPO, revision=ALIGNER_REVISION, dtype=dtype).to(device).eval()
+        except Exception as exc:
+            self._release_cuda_cache()
+            raise self._map_qwen_exception(exc, phase="alignment_load", model_id=ALIGNER_REPO) from exc
+        self._aligner_processor = processor
+        self._aligner_model = model
+
     def _first_result(self, results: Any) -> Any:
         try:
             first = results[0]
         except (IndexError, KeyError, TypeError) as exc:
-            raise AsrError(503, "inference_failed", "Qwen returned no transcription results") from exc
+            raise AsrError(422, "empty_transcription", "Qwen returned no transcription results") from exc
         return first
 
     def _map_qwen_exception(self, exc: Exception, *, phase: str, model_id: str) -> AsrError:
@@ -594,7 +810,7 @@ class _QwenWorkerBackend:
         }
         if "out of memory" in lowered or "cuda oom" in lowered:
             return AsrError(503, "gpu_unavailable", "CUDA out of memory during Qwen ASR", details)
-        if phase == "load" and any(
+        if phase in {"load", "alignment_load"} and any(
             marker in lowered
             for marker in ("download", "connection", "repository", "resolve", "not found", "401", "403", "404")
         ):
@@ -607,6 +823,7 @@ class _QwenTranscriptionItem:
     text: str
     language: str
     warnings: list[str]
+    generation: GenerationMetrics
 
 
 class _HfNativeQwenModel:
@@ -630,20 +847,75 @@ class _HfNativeQwenModel:
             max_new_tokens = 512
         context = kwargs.get("context")
         warnings: list[str] = []
-        if isinstance(context, str) and context:
-            warnings.append("context is not applied by the HF native transcription helper")
 
         apply_request = getattr(self.processor, "apply_transcription_request", None)
         if not callable(apply_request):
             raise RuntimeError("processor.apply_transcription_request is unavailable")
-        inputs = apply_request(audio=audio, language=language)
+        request_kwargs: dict[str, object] = {"audio": audio, "language": language}
+        if isinstance(context, str) and context:
+            try:
+                supports_prompt = "prompt" in inspect.signature(apply_request).parameters
+            except (TypeError, ValueError):
+                supports_prompt = False
+            if not supports_prompt:
+                raise AsrError(
+                    422,
+                    "context_not_supported",
+                    "installed transformers Qwen helper does not support prompt; install the pinned runtime version",
+                )
+            request_kwargs["prompt"] = context
+        if language is None:
+            messages: list[dict[str, object]] = []
+            if isinstance(context, str) and context:
+                messages.append(
+                    {"role": "system", "content": [{"type": "text", "text": context}]}
+                )
+            messages.append(
+                {"role": "user", "content": [{"type": "audio", "audio": audio}]}
+            )
+            apply_chat_template = getattr(self.processor, "apply_chat_template", None)
+            if not callable(apply_chat_template):
+                raise RuntimeError("processor.apply_chat_template is unavailable for automatic language detection")
+            inputs = apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                tokenize=True,
+                return_dict=True,
+            )
+            warnings.append("qwen_auto_language_uses_chat_template_generation_prompt")
+        else:
+            inputs = apply_request(**request_kwargs)
         inputs = inputs.to(self.model.device, self.model.dtype)
         output_ids = self.model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
         generated_ids = output_ids[:, inputs["input_ids"].shape[1] :]
+        prompt_tokens = int(inputs["input_ids"].shape[1])
+        generated_tokens = _sequence_length(generated_ids)
+        reached_limit = generated_tokens >= max_new_tokens
+        ended_with_eos = _ends_with_eos(generated_ids, self.model)
+        if reached_limit and not ended_with_eos:
+            raise AsrError(
+                422,
+                "generation_truncated",
+                "Qwen generation reached max_new_tokens before EOS; transcript may be incomplete",
+                {"generated_tokens": generated_tokens, "max_new_tokens": max_new_tokens},
+            )
+        generation = GenerationMetrics(
+            prompt_tokens=prompt_tokens,
+            generated_tokens=generated_tokens,
+            max_new_tokens=max_new_tokens,
+            truncated=False,
+            finish_reason="eos" if ended_with_eos else "completed",
+        )
         parsed_items = self.processor.decode(generated_ids, return_format="parsed")
-        return [self._item_from_parsed(item, warnings=warnings) for item in parsed_items]
+        return [self._item_from_parsed(item, warnings=warnings, generation=generation) for item in parsed_items]
 
-    def _item_from_parsed(self, parsed: object, *, warnings: list[str]) -> _QwenTranscriptionItem:
+    def _item_from_parsed(
+        self,
+        parsed: object,
+        *,
+        warnings: list[str],
+        generation: GenerationMetrics,
+    ) -> _QwenTranscriptionItem:
         if isinstance(parsed, dict):
             text = parsed.get("transcription", parsed.get("text", ""))
             language = parsed.get("language", "")
@@ -651,5 +923,56 @@ class _HfNativeQwenModel:
                 text=text if isinstance(text, str) else str(text),
                 language=language if isinstance(language, str) else str(language),
                 warnings=warnings,
+                generation=generation,
             )
-        return _QwenTranscriptionItem(text=str(parsed), language="", warnings=warnings)
+        return _QwenTranscriptionItem(text=str(parsed), language="", warnings=warnings, generation=generation)
+
+
+def _sequence_length(value: Any) -> int:
+    shape = getattr(value, "shape", None)
+    if shape is not None and len(shape) > 0:
+        return int(shape[-1])
+    try:
+        return len(value[0])
+    except (IndexError, KeyError, TypeError):
+        try:
+            return len(value)
+        except TypeError:
+            return 0
+
+
+def _ends_with_eos(generated_ids: Any, model: Any) -> bool:
+    if _sequence_length(generated_ids) == 0:
+        return False
+    config = getattr(model, "generation_config", None)
+    eos = getattr(config, "eos_token_id", None)
+    if eos is None:
+        eos = getattr(getattr(model, "config", None), "eos_token_id", None)
+    eos_ids = {int(item) for item in eos} if isinstance(eos, list | tuple | set) else {int(eos)} if eos is not None else set()
+    if not eos_ids:
+        return False
+    try:
+        last = generated_ids[0, -1]
+    except (IndexError, KeyError, TypeError):
+        try:
+            last = generated_ids[0][-1]
+        except (IndexError, KeyError, TypeError):
+            return False
+    item = getattr(last, "item", None)
+    value = item() if callable(item) else last
+    return int(value) in eos_ids
+
+
+def _is_character_alignment(items: list[dict[str, object]]) -> bool:
+    texts = [str(item.get("text", "")) for item in items]
+    cjk = sum(any(_is_cjk(character) for character in text) for text in texts)
+    return bool(texts) and cjk >= max(1, len(texts) // 2)
+
+
+def _is_cjk(character: str) -> bool:
+    codepoint = ord(character)
+    return (
+        0x3400 <= codepoint <= 0x4DBF
+        or 0x4E00 <= codepoint <= 0x9FFF
+        or 0xF900 <= codepoint <= 0xFAFF
+    )

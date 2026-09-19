@@ -68,12 +68,14 @@ Bridge 读取以下环境变量：
 - `asr_get_model_status`：查询一个模型的生命周期状态和活跃请求数。
 - `asr_transcribe_file`：上传并转录本地文件；超过同步阈值时可能直接返回异步 job。
 - `asr_create_job`：显式创建 FIFO 异步转录 job。
-- `asr_get_job`：获取真实阶段、chunk 进度、临时文字和最终结果。
+- `asr_get_job`：默认 `detail=compact` 获取真实阶段和 chunk 计数；任务结束后用 `detail=full` 取一次最终结果。
 - `asr_cancel_job`：安全请求取消，不强杀正在执行的模型推理。
 - `asr_load_model`：加载已声明模型。
 - `asr_unload_model`：等待活跃请求完成后安全卸载模型。
 
 调用方必须先使用 `asr_list_models` 做能力发现，不得硬编码 MOSS、timestamps、speaker resolution 或后端能力。最终转录正文始终以同步结果的 `text` 或 job 的 `result.text` 为准。
+
+`asr_transcribe_file` 与 `asr_create_job` 支持 `purpose=oral_analysis|podcast`、逐素材 `context`、`hotwords` 和 `idempotency_key`。用途相关字段默认保持未设置，让 REST 服务应用一致的 profile；若 MCP 调用显式传入 `timestamps`、`response_format` 或 `speaker_resolution`，则以显式值为准并接受能力校验，不做静默降级。不要让一次 MCP tool call 等待数小时；长素材先创建 job，由 Mac 侧编排低频查询 compact 状态。
 
 ## 本地验收
 

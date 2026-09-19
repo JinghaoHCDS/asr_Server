@@ -215,17 +215,19 @@ async def test_transcription_passes_context_and_hotwords_to_adapter(client: Asyn
     assert "Qwen3-ASR" not in body["text"]
 
 
-async def test_transcription_rejects_context_over_hard_limit(client: AsyncClient) -> None:
+async def test_transcription_truncates_context_over_hard_limit(client: AsyncClient) -> None:
     response = await client.post(
         "/v1/audio/transcriptions",
         files={"file": ("sample.wav", make_wav(0.1), "audio/wav")},
         data={"context": "x" * 4001},
     )
 
-    assert response.status_code == 400
+    assert response.status_code == 200
     body = response.json()
-    assert body["error"]["code"] == "bad_request"
-    assert body["error"]["details"]["max_context_chars"] == 4000
+    assert body["context"]["requested"] is True
+    assert body["context"]["applied"] is True
+    assert body["context"]["truncated"] is True
+    assert "context_truncated:body" in body["warnings"]
 
 
 async def test_text_response_format_still_supports_context(client: AsyncClient) -> None:
@@ -453,9 +455,10 @@ async def test_moss_anchor_replay_returns_four_global_speakers(
             backend: str,
             language: str,
             context: str,
-            max_new_tokens: int | None,
+            timestamps: str = "none",
+            max_new_tokens: int | None = None,
         ) -> TranscriptionResult:
-            del model_id, backend, language, context
+            del model_id, backend, language, context, timestamps
             self.calls += 1
             self.max_new_tokens_values.append(max_new_tokens)
             if self.calls == 1:
@@ -520,6 +523,8 @@ async def test_moss_anchor_replay_returns_four_global_speakers(
         "anchor_budget_limited": False,
         "candidate_speakers": 0,
         "missing_segment_chunks": 0,
+        "max_speakers": 4,
+        "speaker_capacity_exceeded": 0,
     }
     assert body["execution"]["speaker_scope"] == "global"
     assert body["segments"][-2]["speaker"] == "speaker-0004"
@@ -571,9 +576,10 @@ async def test_required_speaker_resolution_rejects_an_anchor_identity_conflict()
             backend: str,
             language: str,
             context: str,
-            max_new_tokens: int | None,
+            timestamps: str = "none",
+            max_new_tokens: int | None = None,
         ) -> TranscriptionResult:
-            del model_id, backend, language, context, max_new_tokens
+            del model_id, backend, language, context, timestamps, max_new_tokens
             self.calls += 1
             if self.calls == 1:
                 return TranscriptionResult(
@@ -631,9 +637,10 @@ async def test_required_native_resolution_rejects_text_without_speaker_segments(
             backend: str,
             language: str,
             context: str,
-            max_new_tokens: int | None,
+            timestamps: str = "none",
+            max_new_tokens: int | None = None,
         ) -> TranscriptionResult:
-            del audio, model_id, backend, language, context, max_new_tokens
+            del audio, model_id, backend, language, context, timestamps, max_new_tokens
             return TranscriptionResult(text="有正文但解析不到说话人段", duration=1.0, language="zh", warnings=[])
 
     app = create_app(settings=Settings(enable_moss=True))
@@ -771,9 +778,10 @@ async def test_batch_result_count_mismatch_returns_inference_failed(
         backend: str,
         language: str,
         context: str,
-        max_new_tokens: int | None,
+        timestamps: str = "none",
+        max_new_tokens: int | None = None,
     ) -> list[TranscriptionResult]:
-        del self, audio_chunks, model_id, backend, language, context, max_new_tokens
+        del self, audio_chunks, model_id, backend, language, context, timestamps, max_new_tokens
         return []
 
     monkeypatch.setattr(MockAsrAdapter, "transcribe_batch", bad_batch)

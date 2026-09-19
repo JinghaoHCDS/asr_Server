@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import os
 import shutil
 import tempfile
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from time import perf_counter
@@ -61,6 +63,17 @@ def utc_iso(value: datetime | None) -> str | None:
 
 def _partial_chunks(texts: list[str]) -> list[dict[str, object]]:
     return [{"index": index, "text": text} for index, text in enumerate(texts, start=1)]
+
+
+def _request_fingerprint(path: Path, request: TranscriptionRequest) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while block := source.read(1024 * 1024):
+            digest.update(block)
+    digest.update(
+        json.dumps(asdict(request), ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
+    return digest.hexdigest()
 
 
 @dataclass
@@ -124,6 +137,8 @@ class TranscriptionJob:
     workspace: AudioWorkspace | None = None
     chunk_windows: list[tuple[float, float]] = field(default_factory=list)
     partial_texts: list[str] = field(default_factory=list)
+    idempotency_key: str | None = None
+    request_fingerprint: str | None = None
 
 
 class JobManager:
@@ -131,6 +146,7 @@ class JobManager:
         self._manager = manager
         self._settings = settings
         self._jobs: dict[str, TranscriptionJob] = {}
+        self._idempotency: dict[str, str] = {}
         self._queue: deque[str] = deque()
         self._condition = asyncio.Condition()
         self._worker: asyncio.Task[None] | None = None
@@ -199,10 +215,29 @@ class JobManager:
         await self.start()
         self._expire_jobs()
         validated = validate_transcription_request(self._manager, request)
+        if request.idempotency_key is not None and len(request.idempotency_key) > 200:
+            raise AsrError(400, "bad_request", "idempotency_key exceeds 200 characters")
+        request_fingerprint = await asyncio.to_thread(
+            _request_fingerprint,
+            workspace.upload_path,
+            request,
+        )
         job_id = f"job_{uuid4().hex}"
         created_at = utc_now()
         upload_name = filename or "upload.bin"
         async with self._condition:
+            if request.idempotency_key:
+                existing_id = self._idempotency.get(request.idempotency_key)
+                existing = self._jobs.get(existing_id) if existing_id is not None else None
+                if existing is not None:
+                    if existing.request_fingerprint != request_fingerprint:
+                        raise AsrError(
+                            409,
+                            "idempotency_conflict",
+                            "idempotency_key was already used with different audio or parameters",
+                        )
+                    await workspace.cleanup()
+                    return {**self._job_create_payload(existing), "deduplicated": True}
             if self._active_job_count() >= self._settings.max_queued_jobs:
                 raise AsrError(
                     429,
@@ -228,6 +263,7 @@ class JobManager:
                     "content_type": content_type,
                     "size_bytes": workspace.size_bytes,
                     "response_format": request.response_format,
+                    "purpose": request.purpose,
                     "timestamps": request.timestamps,
                     "split_strategy": request.split_strategy,
                     "max_chunk_seconds": request.max_chunk_seconds,
@@ -235,19 +271,28 @@ class JobManager:
                     "preserve_segments": request.preserve_segments,
                     "context_chars": len(request.context),
                     "hotwords_chars": len(request.hotwords or ""),
+                    "context": validated.context.request_summary(),
+                    "pause_threshold_seconds": request.pause_threshold_seconds,
+                    "idempotency_key": request.idempotency_key,
                 },
                 temp_paths=[upload_path, work_dir],
                 workspace=workspace,
+                idempotency_key=request.idempotency_key,
+                request_fingerprint=request_fingerprint,
             )
             self._jobs[job_id] = job
+            if request.idempotency_key:
+                self._idempotency[request.idempotency_key] = job_id
             self._queue.append(job_id)
             self._condition.notify()
             return self._job_create_payload(job)
 
-    async def get_job(self, job_id: str) -> dict[str, object]:
+    async def get_job(self, job_id: str, *, detail: str = "compact") -> dict[str, object]:
+        if detail not in {"compact", "full"}:
+            raise AsrError(400, "bad_request", "detail must be compact or full")
         self._expire_jobs()
         job = self._job_or_404(job_id)
-        return self._job_payload(job)
+        return self._job_payload(job, detail=detail)
 
     async def cancel_job(self, job_id: str) -> dict[str, object]:
         self._expire_jobs()
@@ -447,14 +492,19 @@ class JobManager:
             "status_url": f"/v1/jobs/{job.id}",
         }
 
-    def _job_payload(self, job: TranscriptionJob) -> dict[str, object]:
+    def _job_payload(self, job: TranscriptionJob, *, detail: str = "full") -> dict[str, object]:
+        progress = job.progress.to_api()
+        if detail == "compact":
+            progress.pop("text", None)
+            progress.pop("chunks", None)
+            progress.pop("chunk_text", None)
         payload: dict[str, object] = {
             "id": job.id,
             "status": job.status,
             "model": job.model,
             "backend": job.backend,
             "queue_position": self._queue_position(job.id),
-            "progress": job.progress.to_api(),
+            "progress": progress,
             "created_at": utc_iso(job.created_at),
             "started_at": utc_iso(job.started_at),
             "completed_at": utc_iso(job.completed_at),
@@ -464,8 +514,10 @@ class JobManager:
         }
         if job.split is not None:
             payload["split"] = job.split
-        if job.status in {"completed", "failed", "cancelled", "expired"}:
+        if job.status in {"completed", "failed", "cancelled", "expired"} and detail == "full":
             payload["result"] = job.result
+            payload["error"] = job.error
+        elif job.status == "failed":
             payload["error"] = job.error
         return payload
 
@@ -489,6 +541,8 @@ class JobManager:
             if job.expires_at <= now:
                 job.result = None
                 job.error = None
+                if job.idempotency_key:
+                    self._idempotency.pop(job.idempotency_key, None)
                 del self._jobs[job_id]
 
     async def _cleanup_job_files(self, job: TranscriptionJob) -> None:

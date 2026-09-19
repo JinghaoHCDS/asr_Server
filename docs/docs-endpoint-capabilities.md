@@ -30,6 +30,36 @@ through `GET /v1/models`.
   transcribe audio, expose GPU state, or prove that a backend has passed
   runtime validation.
 
+## 2026-09-19 upgrade workflows
+
+- `purpose=oral_analysis` requests real Qwen forced alignment and verbose
+  evidence. Responses preserve the original-media timeline and expose actual
+  char/word units, non-semantic reading groups, acoustic pause candidates and
+  reproducible speaking-rate denominators. The server never invents fine
+  timestamps by distributing sentence duration over characters.
+- `purpose=podcast` selects the enabled MOSS diarization model and Anchor
+  Replay without enabling unnecessary word alignment. Anonymous speaker IDs
+  are scoped to one item, limited to four resolved identities, and uncertain
+  segments remain `unresolved`/`mixed` instead of being guessed from content.
+- Per-item `context` and `hotwords` are normalized, bounded and passed into the
+  selected model prompt. The response reports `requested`, `applied`, `method`,
+  truncation and ignore reasons; vocabulary is reference data, not a required
+  output list or an instruction that can change service permissions.
+- Long work uses asynchronous FIFO jobs. Poll with compact detail and fetch one
+  full result after completion. The job store remains in-memory; submission
+  idempotency prevents duplicate jobs during network retry but is not a
+  persistent computation cache.
+- The Mac-side `scripts/batch_transcribe.py` binds each media path directly to
+  its metadata, rate-limits submissions, resumes local state and atomically
+  writes `output/index.md`, `output/manifest.json`, and per-item
+  `transcript.json`/`transcript.md`. This is a client workflow rather than a new
+  multi-file HTTP endpoint.
+- Current validation limits remain visible: Chinese short-form alignment and
+  shorter Anchor Replay samples have real GPU evidence, while full 4–5 hour
+  podcast speaker consistency still requires target-material acceptance. Read
+  capability flags and quality warnings instead of assuming success from the
+  selected purpose alone.
+
 ## Implemented HTTP API surface
 
 The current FastAPI app registers these business endpoints:
@@ -45,7 +75,7 @@ The current FastAPI app registers these business endpoints:
 | `DELETE` | `/v1/models` | Applies unload behavior to all declared models. |
 | `POST` | `/v1/audio/transcriptions` | Accepts one uploaded audio file, validates requested capabilities, normalizes/splits audio, transcribes, merges results, and returns JSON, verbose JSON shape, plain text, or `202` queued job for audio over the sync threshold. |
 | `POST` | `/v1/audio/transcription-jobs` | Creates an in-memory asynchronous transcription job in a single-worker FIFO queue. |
-| `GET` | `/v1/jobs/{job_id}` | Returns queued/running/completed/failed/cancelled job state, queue position, progress, result, or error. |
+| `GET` | `/v1/jobs/{job_id}` | Returns queued/running/completed/failed/cancelled state. `detail=compact` is the default and omits transcript bodies; use `detail=full` once for the final result. |
 | `DELETE` | `/v1/jobs/{job_id}` | Cancels queued jobs immediately or requests cancellation at the next running job phase/chunk boundary. |
 | `POST` | `/v1/audio/alignments` | Exists only as a reserved endpoint and currently returns `422 capability_not_supported`. |
 
@@ -56,17 +86,25 @@ The current FastAPI app registers these business endpoints:
 - `qwen3-asr-1.7b`
 - `qwen3-asr-0.6b`
 
-For both models, the declared capability set is:
+For both models, the base declared capability set is:
 
 - `transcription: true`
 - `backends: ["transformers"]`
 - `streaming: false`
-- `timestamps: []`
-- `forced_alignment: false`
+- `timestamps: []` and `forced_alignment: false` until the alignment gate is enabled
 - `diarization: false`
 - `segment_timestamps: false`
 - language values as returned by `/v1/models`
 - Chinese dialect values as returned by `/v1/models`
+- `context_prompt: true`
+
+After the real Qwen aligner smoke passes, setting
+`ASR_ENABLE_QWEN_ALIGNMENT=1` changes the two Qwen declarations to
+`timestamps: ["auto", "word", "char"]` and `forced_alignment: true`. The
+transcription response then exposes the aligner's actual unit granularity,
+source and status. CJK output is commonly character-granular; callers must use
+the returned `granularity` rather than assuming every Chinese result is char
+aligned.
 
 The default model is controlled by `ASR_DEFAULT_MODEL` and defaults to
 `qwen3-asr-1.7b`. MOSS cannot be selected as the default model in this
@@ -88,7 +126,7 @@ Its first-release capability set is deliberately conservative:
 - `execution_modes: ["native_long_form", "chunked"]`
 - `auto_execution_mode: "native_long_form"`
 - `max_new_tokens: 65536`
-- `speaker_scopes: ["global", "chunk"]`
+- `speaker_scopes: ["global", "chunk", "mixed"]`
 - `validated_native_max_seconds: 1801.0`
 - `automatic_fallback_chunk_seconds: 1800.0`
 - `speaker_resolution_modes: ["off", "auto", "required"]`
@@ -104,12 +142,17 @@ For MOSS, `response_format=verbose_json` returns parsed
 request parameter still does not support `word` or `char` timestamps, and MOSS
 segment timestamps are not treated as forced alignment.
 For `split_strategy=auto`, MOSS uses one native invocation through the validated
-30-minute class window and returns `speaker_scope=global`. Above 1801 seconds it
-explicitly falls back to 1800-second fixed chunks. Cross-chunk speaker labels
-are scoped as `chunk-NNNN:S01`; each segment also returns `speaker_label`,
-`speaker_scope=chunk`, and `chunk_index`. Explicit `split_strategy=none` is an
-advanced, unvalidated long-form challenge and may return a controlled 422 when
-tail coverage, token, or context checks fail.
+30-minute class window. Above 1801 seconds it explicitly falls back to chunks.
+With `speaker_resolution=off`, labels remain chunk-local. With `auto` or
+`required`, Anchor Replay carries speaker anchors across chunks and returns
+anonymous task-local `speaker-NNNN` labels, with a maximum of four identities.
+Uncertain or over-capacity segments remain unresolved and make the scope
+`mixed`; they are never renamed and presented as verified global identities.
+Anchor Replay limits each body chunk to 1200 seconds and uses an automatic
+generation budget of at least 24000 unless the caller explicitly supplied a
+value. Explicit `split_strategy=none` remains an advanced long-form challenge
+and may return a controlled error on token, repetition or audible-speech
+coverage checks.
 
 ## Transcription request behavior
 
@@ -120,8 +163,12 @@ Implemented form fields for `POST /v1/audio/transcriptions` and
 - `model`: optional; defaults to the configured default model.
 - `language`: defaults to `auto`.
 - `response_format`: `json`, `text`, or `verbose_json`.
-- `timestamps`: accepts `none`, `word`, or `char` syntactically, but only
-  `none` is supported by declared capabilities today.
+- `purpose`: `transcription` (default), `oral_analysis`, or `podcast`.
+  `oral_analysis` selects verbose output plus real alignment; `podcast` selects
+  diarization/Anchor Replay without unnecessary word alignment. Explicit form
+  fields still override profile defaults.
+- `timestamps`: `none`, `auto`, `word`, or `char`. Non-`none` values require a
+  model currently declaring that capability; there is no silent downgrade.
 - `backend`: accepts `auto`, `transformers`, or `vllm` syntactically, but only
   `auto` resolving to `transformers` and explicit `transformers` are supported
   by declared capabilities today.
@@ -132,6 +179,11 @@ Implemented form fields for `POST /v1/audio/transcriptions` and
   to `4000` characters.
 - `hotwords`: optional JSON string array or comma-separated string, merged into
   adapter context.
+- `pause_threshold_seconds`: alignment-gap candidate threshold, from 0.2 to
+  10 seconds. A candidate is acoustic evidence, not a semantic pause label.
+- `idempotency_key`: optional asynchronous submission key (maximum 200
+  characters). Reuse with different audio or parameters returns
+  `idempotency_conflict`.
 - `split_strategy`: `auto`, `none`, `fixed`, `silero`, `energy`, or `vad`.
 - `max_chunk_seconds`: optional per-request chunk upper bound.
 - `overlap_seconds`: optional chunk overlap.
@@ -143,7 +195,11 @@ Implemented form fields for `POST /v1/audio/transcriptions` and
   not enrolled names or biometric identity claims. A non-`off` mode requires
   `response_format=verbose_json`, because other formats do not expose segments.
 
-Successful JSON responses include `execution` and `generation`. Clients should
+Successful JSON responses include `execution`, `generation`, `context`, and
+`timing`. `context` reports whether the prompt was requested and applied, the
+method, and truncation/ignore information. Top-level `timestamps` are not created
+by distributing sentence duration by character count; they come from the
+declared aligner, and reading groups remain non-semantic. Clients should
 consume `execution.mode`, `execution.speaker_scope`,
 `execution.automatic_chunk_fallback`, `generation.generated_tokens`,
 `generation.max_new_tokens`, and `generation.segment_coverage_ratio` instead of
@@ -163,6 +219,10 @@ The job manager is in-memory and process-local:
 - `ASR_MAX_QUEUED_JOBS` defaults to `20`.
 - Job result TTL defaults to `3600` seconds.
 - A process restart loses in-memory jobs.
+- `GET /v1/jobs/{job_id}` defaults to compact output. It does not repeat the
+  accumulated transcript; `detail=full` returns the completed result.
+- Reusing an asynchronous `idempotency_key` protects submit retries for the
+  lifetime of the in-memory job. It is not a persistent computation cache.
 - Progress reports real service phases and chunk completion counts; it does not
   invent token-level or frame-level Qwen progress inside a chunk.
 - Uploaded job files and temporary work directories are cleaned after completed,
@@ -178,7 +238,12 @@ The service can run with two adapter modes:
   environment plus HF native Transformers dependencies to be installed and
   validated separately.
 
-MOSS is gated independently:
+The real-GPU features are gated independently:
+
+- `ASR_ENABLE_QWEN_ALIGNMENT=0` or unset keeps Qwen timestamp declarations
+  disabled.
+- `ASR_ENABLE_QWEN_ALIGNMENT=1` enables the lazy official Qwen forced aligner
+  declarations after its real-GPU smoke has passed.
 
 - `ASR_ENABLE_MOSS=0` or unset keeps MOSS out of `/v1/models`.
 - `ASR_ENABLE_MOSS=1` adds `moss-transcribe-diarize-0.9b`.
@@ -203,13 +268,12 @@ These items must not be described as available capabilities:
   `422 capability_not_supported`.
 - SGLang Omni as a first-release serving path. It is not integrated into this
   gateway and must not be exposed on a LAN port by this service.
-- Timestamps. `timestamps=word` and `timestamps=char` return
-  `422 capability_not_supported`.
-- Forced alignment. `/v1/audio/alignments` always returns
-  `422 capability_not_supported`.
-- Cross-chunk speaker identity stitching for MOSS. When audio is split into
-  chunks, MOSS speaker labels are chunk-local and the response warnings include
-  `moss_speaker_labels_are_chunk_local`.
+- A standalone alignment API. `/v1/audio/alignments` remains reserved and
+  returns `422 capability_not_supported`; verified alignment is requested on
+  the transcription routes.
+- Guaranteed cross-chunk speaker attribution. Anchor Replay can resolve up to
+  four task-local speakers, but uncertain segments remain `unresolved` and the
+  response explicitly reports `mixed` rather than guessing from content.
 - Multiple-file transcription in one request. The implemented routes accept a
   single `file` upload.
 - Database, Redis, Celery, distributed workers, multi-worker inference, public

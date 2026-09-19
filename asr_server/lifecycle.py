@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field, replace
@@ -64,6 +65,7 @@ class ModelRuntime:
             "provider": self.definition.provider,
             "status": self.status,
             "default": self.definition.default,
+            "revision": self.definition.revision,
             "capabilities": self.definition.capabilities.to_api(),
         }
 
@@ -115,6 +117,22 @@ class ModelLifecycleManager:
 
     def list_models(self) -> list[dict[str, object]]:
         return [runtime.model_summary() for runtime in self._runtimes.values()]
+
+    def model_for_purpose(self, purpose: str) -> str:
+        if purpose == "podcast":
+            candidate = next(
+                (runtime.definition.id for runtime in self._runtimes.values() if runtime.definition.capabilities.diarization),
+                None,
+            )
+            if candidate is None:
+                raise AsrError(
+                    422,
+                    "capability_not_supported",
+                    "purpose=podcast requires an enabled diarization model",
+                    {"required_capability": "diarization"},
+                )
+            return candidate
+        return self.default_model_id
 
     def runtime_for(self, model_id: str) -> ModelRuntime:
         try:
@@ -304,6 +322,7 @@ class ModelLifecycleManager:
                 backend=resolved_backend,
                 language=language,
                 context=context,
+                timestamps=timestamps,
                 max_new_tokens=max_new_tokens,
                 batch_size=batch_size,
                 before_chunk=before_chunk,
@@ -339,6 +358,7 @@ class ModelLifecycleManager:
                 backend=resolved_backend,
                 language=language,
                 context=context,
+                timestamps=timestamps,
                 max_new_tokens=max_new_tokens,
                 before_chunk=before_chunk,
                 after_chunk=after_chunk,
@@ -407,6 +427,7 @@ class ModelLifecycleManager:
         backend: str,
         language: str,
         context: str,
+        timestamps: str,
         max_new_tokens: int | None,
         before_chunk: ChunkProgressCallback | None,
         after_chunk: ChunkResultCallback | None,
@@ -417,15 +438,20 @@ class ModelLifecycleManager:
             if before_chunk is not None:
                 await before_chunk(index, total_count)
             chunk_started = perf_counter()
+            audio_input = sequence.audio_for(index)
             try:
-                raw_result = await _call_adapter(
-                    lambda: runtime.adapter.transcribe(
-                        sequence.audio_for(index),
-                        model_id=model_id,
-                        backend=backend,
-                        language=language,
-                        context=context,
-                        max_new_tokens=max_new_tokens,
+                raw_result = await _retry_inference_once(
+                    lambda: _call_adapter(
+                        lambda: _adapter_transcribe(
+                            runtime.adapter,
+                            audio_input,
+                            model_id=model_id,
+                            backend=backend,
+                            language=language,
+                            context=context,
+                            timestamps=timestamps,
+                            max_new_tokens=max_new_tokens,
+                        )
                     )
                 )
             except AsrError:
@@ -457,6 +483,7 @@ class ModelLifecycleManager:
         backend: str,
         language: str,
         context: str,
+        timestamps: str,
         max_new_tokens: int | None,
         batch_size: int,
         before_chunk: ChunkProgressCallback | None,
@@ -466,14 +493,18 @@ class ModelLifecycleManager:
             if before_chunk is not None:
                 await before_chunk(0, 1)
             chunk_started = perf_counter()
-            result = await _call_adapter(
-                lambda: runtime.adapter.transcribe(
-                    audio_chunks[0],
-                    model_id=model_id,
-                    backend=backend,
-                    language=language,
-                    context=context,
-                    max_new_tokens=max_new_tokens,
+            result = await _retry_inference_once(
+                lambda: _call_adapter(
+                    lambda: _adapter_transcribe(
+                        runtime.adapter,
+                        audio_chunks[0],
+                        model_id=model_id,
+                        backend=backend,
+                        language=language,
+                        context=context,
+                        timestamps=timestamps,
+                        max_new_tokens=max_new_tokens,
+                    )
                 )
             )
             if result.timings.total_ms == 0:
@@ -486,7 +517,7 @@ class ModelLifecycleManager:
             return [result]
 
         results = []
-        effective_batch_size = max(batch_size, 1)
+        effective_batch_size = 1 if timestamps != "none" else max(batch_size, 1)
         completed_count = 0
         total_count = len(audio_chunks)
         for batch in _chunked(audio_chunks, effective_batch_size):
@@ -496,16 +527,38 @@ class ModelLifecycleManager:
                     await before_chunk(batch_start_index + offset, total_count)
             batch_started = perf_counter()
             try:
-                batch_results = await _call_adapter(
-                    lambda: runtime.adapter.transcribe_batch(
-                        batch,
-                        model_id=model_id,
-                        backend=backend,
-                        language=language,
-                        context=context,
-                        max_new_tokens=max_new_tokens,
+                if timestamps != "none":
+                    batch_results = [
+                        await _retry_inference_once(
+                            lambda: _call_adapter(
+                                lambda: _adapter_transcribe(
+                                    runtime.adapter,
+                                    batch[0],
+                                    model_id=model_id,
+                                    backend=backend,
+                                    language=language,
+                                    context=context,
+                                    timestamps=timestamps,
+                                    max_new_tokens=max_new_tokens,
+                                )
+                            )
+                        )
+                    ]
+                else:
+                    batch_results = await _retry_inference_once(
+                        lambda: _call_adapter(
+                            lambda: _adapter_transcribe_batch(
+                                runtime.adapter,
+                                batch,
+                                model_id=model_id,
+                                backend=backend,
+                                language=language,
+                                context=context,
+                                timestamps=timestamps,
+                                max_new_tokens=max_new_tokens,
+                            )
+                        )
                     )
-                )
             except AsrError:
                 raise
             except Exception as exc:
@@ -685,6 +738,34 @@ def _chunked(items: list[AudioInput], batch_size: int) -> list[list[AudioInput]]
     return [items[index : index + batch_size] for index in range(0, len(items), batch_size)]
 
 
+async def _retry_inference_once(operation: Callable[[], Awaitable[T]]) -> T:
+    """Retry one non-fatal inference failure while retaining prior chunk results."""
+
+    try:
+        return await operation()
+    except AsrError as first:
+        if first.code != "inference_failed" or first.details.get("worker_fatal"):
+            raise
+    try:
+        result = await operation()
+    except AsrError as second:
+        second.details["attempts"] = 2
+        raise
+    return _with_retry_warning(result)
+
+
+def _with_retry_warning(result: T) -> T:
+    warning = "inference_retry_succeeded:attempt=2"
+    if isinstance(result, TranscriptionResult):
+        return replace(result, warnings=list(dict.fromkeys([*result.warnings, warning])))
+    if isinstance(result, list) and all(isinstance(item, TranscriptionResult) for item in result):
+        return [
+            replace(item, warnings=list(dict.fromkeys([*item.warnings, warning])))
+            for item in result
+        ]  # type: ignore[return-value]
+    return result
+
+
 async def _call_adapter(factory: Callable[[], Coroutine[Any, Any, T]]) -> T:
     operation = asyncio.create_task(asyncio.to_thread(lambda: asyncio.run(factory())))
     try:
@@ -697,6 +778,52 @@ async def _call_adapter(factory: Callable[[], Coroutine[Any, Any, T]]) -> T:
             await operation
         finally:
             raise
+
+
+def _adapter_transcribe(
+    adapter: AsrAdapter,
+    audio: AudioInput,
+    *,
+    model_id: str,
+    backend: str,
+    language: str,
+    context: str,
+    timestamps: str,
+    max_new_tokens: int | None,
+) -> Coroutine[Any, Any, TranscriptionResult]:
+    kwargs: dict[str, Any] = {
+        "model_id": model_id,
+        "backend": backend,
+        "language": language,
+        "context": context,
+        "max_new_tokens": max_new_tokens,
+    }
+    if "timestamps" in inspect.signature(adapter.transcribe).parameters:
+        kwargs["timestamps"] = timestamps
+    return adapter.transcribe(audio, **kwargs)
+
+
+def _adapter_transcribe_batch(
+    adapter: AsrAdapter,
+    audio_chunks: list[AudioInput],
+    *,
+    model_id: str,
+    backend: str,
+    language: str,
+    context: str,
+    timestamps: str,
+    max_new_tokens: int | None,
+) -> Coroutine[Any, Any, list[TranscriptionResult]]:
+    kwargs: dict[str, Any] = {
+        "model_id": model_id,
+        "backend": backend,
+        "language": language,
+        "context": context,
+        "max_new_tokens": max_new_tokens,
+    }
+    if "timestamps" in inspect.signature(adapter.transcribe_batch).parameters:
+        kwargs["timestamps"] = timestamps
+    return adapter.transcribe_batch(audio_chunks, **kwargs)
 
 
 def _consume_task_exception(task: asyncio.Task[None]) -> None:

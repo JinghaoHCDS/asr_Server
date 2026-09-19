@@ -54,9 +54,15 @@ async def create_job(
     return cast(dict[str, object], response.json())
 
 
-async def wait_for_status(client: AsyncClient, job_id: str, statuses: set[str]) -> dict[str, object]:
+async def wait_for_status(
+    client: AsyncClient,
+    job_id: str,
+    statuses: set[str],
+    *,
+    detail: str = "full",
+) -> dict[str, object]:
     for _ in range(80):
-        response = await client.get(f"/v1/jobs/{job_id}")
+        response = await client.get(f"/v1/jobs/{job_id}", params={"detail": detail})
         assert response.status_code == 200
         body = response.json()
         body = cast(dict[str, object], body)
@@ -94,6 +100,60 @@ async def test_create_job_returns_accepted_and_status_url(client: AsyncClient) -
     assert completed_result["text"]
     assert completed_result["model"] == "qwen3-asr-1.7b"
     assert completed_progress["percent"] == 100.0
+
+
+async def test_job_status_is_compact_by_default_and_full_is_explicit(client: AsyncClient) -> None:
+    created = await create_job(client)
+    await wait_for_status(client, str(created["id"]), {"completed"})
+
+    compact = await client.get(f"/v1/jobs/{created['id']}")
+    full = await client.get(f"/v1/jobs/{created['id']}", params={"detail": "full"})
+
+    assert compact.status_code == 200
+    assert "result" not in compact.json()
+    assert "result" in full.json()
+
+
+async def test_job_idempotency_deduplicates_submit_timeout_retry(client: AsyncClient) -> None:
+    fields = {"idempotency_key": "same-material-and-parameters"}
+    first = await create_job(client, data=fields)
+    second = await create_job(client, data=fields)
+
+    assert second["id"] == first["id"]
+    assert second["deduplicated"] is True
+
+
+async def test_job_idempotency_rejects_different_audio(client: AsyncClient) -> None:
+    fields = {"idempotency_key": "conflicting-key"}
+    await create_job(client, audio=make_wav(0.1), data=fields)
+    response = await client.post(
+        "/v1/audio/transcription-jobs",
+        files={"file": ("different.wav", make_wav(0.2), "audio/wav")},
+        data=fields,
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "idempotency_conflict"
+
+
+async def test_purpose_profiles_select_runtime_capabilities_and_defaults() -> None:
+    app = create_app(settings=Settings(enable_moss=True, enable_qwen_alignment=True))
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        oral = await create_job(client, data={"purpose": "oral_analysis"})
+        podcast = await create_job(client, data={"purpose": "podcast"})
+        oral_full = await wait_for_status(client, str(oral["id"]), {"completed"})
+        podcast_full = await wait_for_status(client, str(podcast["id"]), {"completed"})
+
+    assert oral["model"] == "qwen3-asr-1.7b"
+    oral_request = cast(dict[str, Any], oral_full["request"])
+    podcast_request = cast(dict[str, Any], podcast_full["request"])
+    assert oral_request["timestamps"] == "auto"
+    assert oral_request["purpose"] == "oral_analysis"
+    assert podcast["model"] == "moss-transcribe-diarize-0.9b"
+    assert podcast_request["timestamps"] == "none"
+    assert podcast_request["purpose"] == "podcast"
+    result = cast(dict[str, Any], podcast_full["result"])
+    assert result["execution"]["speaker_scope"] == "global"
 
 
 async def test_completed_job_removes_uploaded_temp_files(
@@ -202,7 +262,7 @@ async def test_chunked_job_reports_cumulative_and_latest_chunk_text(
 
         progress: dict[str, Any] | None = None
         for _ in range(80):
-            response = await client.get(f"/v1/jobs/{created['id']}")
+            response = await client.get(f"/v1/jobs/{created['id']}", params={"detail": "full"})
             assert response.status_code == 200
             body = cast(dict[str, Any], response.json())
             candidate = cast(dict[str, Any], body["progress"])

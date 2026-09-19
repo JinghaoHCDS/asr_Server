@@ -42,8 +42,12 @@ def test_live_health_and_models() -> None:
     assert {"qwen3-asr-0.6b", "qwen3-asr-1.7b"}.issubset(model_ids)
 
 
-def test_live_transcription_and_capability_error() -> None:
+def test_live_transcription_and_timestamp_capability() -> None:
     with httpx.Client(timeout=httpx.Timeout(connect=5.0, read=1800.0, write=30.0, pool=5.0), trust_env=False) as client:
+        models_response = client.get(f"{BASE_URL}/v1/models")
+        models_response.raise_for_status()
+        qwen = next(model for model in models_response.json()["models"] if model["id"] == "qwen3-asr-1.7b")
+        timestamp_modes = qwen["capabilities"]["timestamps"]
         with FIXTURE_AUDIO.open("rb") as audio_file:
             transcription = client.post(
                 f"{BASE_URL}/v1/audio/transcriptions",
@@ -58,7 +62,7 @@ def test_live_transcription_and_capability_error() -> None:
             )
 
         with FIXTURE_AUDIO.open("rb") as audio_file:
-            unsupported = client.post(
+            timestamped = client.post(
                 f"{BASE_URL}/v1/audio/transcriptions",
                 files={"file": (FIXTURE_AUDIO.name, audio_file, "audio/wav")},
                 data={
@@ -72,6 +76,11 @@ def test_live_transcription_and_capability_error() -> None:
 
     assert transcription.status_code == 200
     assert transcription.json()["text"]
-    assert unsupported.status_code == 422
-    assert error_code(unsupported) == "capability_not_supported"
-
+    if "word" in timestamp_modes:
+        assert timestamped.status_code == 200
+        body = timestamped.json()
+        assert body["timestamps"]
+        assert all(item["source"] == "qwen3_forced_aligner" for item in body["timestamps"])
+    else:
+        assert timestamped.status_code == 422
+        assert error_code(timestamped) == "capability_not_supported"

@@ -126,9 +126,35 @@ print("transformers:", transformers.__version__)
 assert hasattr(transformers, "AutoProcessor")
 assert hasattr(transformers, "AutoModelForMultimodalLM")
 assert hasattr(transformers, "AutoModelForCausalLM")
+assert hasattr(transformers, "AutoModelForTokenClassification")
 print("HF native Qwen and MOSS loading classes import ok")
 PY
 ```
+
+本轮 Transformers 固定到 `ea31b0c6ab0d1368130b0482aee7293a014c3a38`，因为该官方 revision 的 `apply_transcription_request(..., prompt=...)` 才让 Qwen Context 真正进入输入。安装任何 MOSS/对齐依赖后都要重复上面的 CUDA 验收，禁止让解析器换成 CPU torch。
+
+### 可选 Qwen 强制对齐
+
+先在在线环境拉取并验收 ASR 与官方对齐器：
+
+```bash
+uv run python scripts/qwen_forced_alignment_smoke.py \
+  --audio test-fixtures/audio/test_short.wav \
+  --asr-model Qwen/Qwen3-ASR-0.6B-hf \
+  --language auto
+```
+
+再做带 Context 的真实转录和“音频不存在该词”的反例；反例可用：
+
+```bash
+uv run python scripts/qwen_asr_backend_smoke.py \
+  --backend transformers \
+  --audio test-fixtures/audio/test_short.wav \
+  --prompt 'Reference vocabulary only; do not invent: ABSENTTERMZXQ' \
+  --reject-hallucinated-term ABSENTTERMZXQ
+```
+
+只有两项通过后才用 systemd drop-in 设置 `Environment=ASR_ENABLE_QWEN_ALIGNMENT=1`。对齐器按首次口播请求懒加载；普通转录和播客不承担这部分显存。生产服务处于 offline 模式前必须先完成模型缓存预热。
 
 交互式调试真实 Qwen adapter 时可以使用：
 
@@ -216,8 +242,9 @@ uv pip install silero-vad==6.2.1
 
 同步转录接口和异步 job 接口支持以下调优字段：
 
-- `context`：专有名词、领域背景或热词提示，服务端硬限制 4000 字符。
-- `hotwords`：逗号分隔字符串或 JSON 字符串数组，服务端会合并到本次模型提示，普通日志不记录完整内容。
+- `purpose`：`transcription`、`oral_analysis`、`podcast`；用途配置提供能力默认值，不绕过 `/v1/models` 校验。
+- `context`：正文规范化后最多使用 3000 字符，总 prompt 最多 4000 字符；截断在 `context.truncated` 和 warnings 中可见。
+- `hotwords`：逗号分隔或 JSON 字符串数组，大小写去重，最多 100 个；Qwen 通过官方 system prompt、MOSS 通过 transcription prompt 实际使用，`context.applied/method` 可审计。
 - `max_new_tokens`：可选生成长度上限。Qwen 默认 512、上限 4096；MOSS 默认按单次模型输入时长计算 `max(2048, ceil(seconds * 12))`、上限 65536；多 chunk Anchor Replay 未显式指定时使用至少 24000。达到上限返回 `422 generation_truncated`，不会静默返回残缺正文。
 - `split_strategy`：`auto`、`none`、`fixed`、`silero`、`energy`、`vad`。Qwen `auto` 使用通用有界切分；MOSS `auto` 使用上述原生/1800 秒自动降级策略。
 - `speaker_resolution`：`off`（默认）、`auto`、`required`。只对 MOSS 开放；客户端应先读取 `/v1/models` 的 `speaker_resolution_modes`。
@@ -230,7 +257,7 @@ max_new_tokens=512
 ASR_QWEN_BATCH_SIZE=1
 ```
 
-MOSS 响应的稳定诊断字段为：`execution.mode`、`execution.speaker_scope`、`execution.automatic_chunk_fallback`、`generation.prompt_tokens`、`generation.generated_tokens`、`generation.max_new_tokens`、`generation.peak_vram_allocated_mb` 和 `generation.segment_coverage_ratio`。客户端必须根据 `speaker_scope` 判断 speaker 是否全局有效。
+MOSS 响应的稳定诊断字段为：`execution.mode`、`execution.speaker_scope`、`generation.prompt_tokens`、`generation.generated_tokens`、`generation.max_new_tokens`、`generation.peak_vram_allocated_mb`、`generation.segment_coverage_ratio`、`audible_speech_end_seconds` 和 `uncovered_speech_intervals`。覆盖检查用能量活动区间发现疑似中段空洞并忽略正常尾部静音；能量活动不是可靠的语音分类，覆盖率也不是转录准确率或 speaker 正确率。
 
 Qwen chunk batch size 通过环境变量配置，默认保守为 `1`：
 
@@ -263,7 +290,7 @@ ASR_IDLE_UNLOAD_SECONDS=180
 
 ```text
 POST /v1/audio/transcription-jobs
-GET /v1/jobs/{job_id}
+GET /v1/jobs/{job_id}?detail=compact
 DELETE /v1/jobs/{job_id}
 ```
 
@@ -271,6 +298,7 @@ DELETE /v1/jobs/{job_id}
 
 - 服务端使用内存 JobManager 和单 worker FIFO 队列。
 - 可以提交多个 job，但同一时间只运行一个真实模型转录；后续 job 显示 `queued` 和 `queue_position`。
+- 默认 `detail=compact` 只返回阶段和 chunk 计数，不反复返回累计全文。任务结束后使用一次 `detail=full` 获取结果。
 - 进度是服务端阶段和 chunk 级真实进度，包括 `total_chunks`、`completed_chunks`、`current_chunk`。
 - 不承诺单个模型 chunk 内部 token/帧级百分比。
 - 进程重启后内存 job 可以丢失；客户端应重新提交。
@@ -291,7 +319,10 @@ curl --noproxy '*' -sS \
 返回 `job_id` 后轮询：
 
 ```bash
-curl --noproxy '*' -sS http://127.0.0.1:18080/v1/jobs/<job_id>
+curl --noproxy '*' -sS 'http://127.0.0.1:18080/v1/jobs/<job_id>?detail=compact'
+
+# 完成后仅取一次全文
+curl --noproxy '*' -sS 'http://127.0.0.1:18080/v1/jobs/<job_id>?detail=full'
 ```
 
 Mac 侧局域网验收同样使用 `http://192.168.31.137:18080`，并且必须绕过本机代理。

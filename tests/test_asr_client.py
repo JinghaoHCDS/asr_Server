@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from scripts.asr_client import choose_backend, choose_fallback_model
+import pytest
+
+from scripts.asr_client import choose_backend, choose_fallback_model, choose_model_for_purpose
 
 
 MODELS = [
@@ -32,3 +34,20 @@ def test_choose_backend_preserves_auto() -> None:
 def test_choose_fallback_model_prefers_other_qwen_model() -> None:
     assert choose_fallback_model(MODELS, "qwen3-asr-1.7b") == "qwen3-asr-0.6b"
 
+
+def test_purpose_selection_requires_discovered_capabilities() -> None:
+    models = [
+        {
+            "id": "aligned",
+            "capabilities": {"forced_alignment": True, "timestamps": ["word"]},
+        },
+        {
+            "id": "podcast",
+            "capabilities": {"diarization": True, "speaker_resolution_modes": ["auto"]},
+        },
+    ]
+
+    assert choose_model_for_purpose(models, "oral_analysis", None) == "aligned"
+    assert choose_model_for_purpose(models, "podcast", None) == "podcast"
+    with pytest.raises(RuntimeError):
+        choose_model_for_purpose(models, "oral_analysis", "podcast")

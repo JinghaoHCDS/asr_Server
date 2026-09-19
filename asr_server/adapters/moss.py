@@ -13,11 +13,15 @@ from typing import Any
 
 from asr_server.adapters.base import (
     AudioInput,
+    ContextApplication,
     GenerationMetrics,
     TranscriptionResult,
     TranscriptionSegment,
     TranscriptionTimings,
+    TimestampItem,
 )
+from asr_server.audio.metadata import inspect_audio_path
+from asr_server.audio.splitter import _energy_intervals_path
 from asr_server.errors import AsrError
 from asr_server.registry import MOSS_MODEL_ID
 from asr_server.workers.transport import ProcessRpcTransport
@@ -69,6 +73,7 @@ def _moss_worker_main(conn: Connection, model_id: str) -> None:
                             backend=backend.loaded_backend or "transformers",
                             language=str(request["language"]),
                             context=str(request["context"]),
+                            timestamps=str(request.get("timestamps", "none")),
                             max_new_tokens=_optional_int(request.get("max_new_tokens")),
                         )
                     )
@@ -82,6 +87,7 @@ def _moss_worker_main(conn: Connection, model_id: str) -> None:
                             backend=backend.loaded_backend or "transformers",
                             language=str(request["language"]),
                             context=str(request["context"]),
+                            timestamps=str(request.get("timestamps", "none")),
                             max_new_tokens=_optional_int(request.get("max_new_tokens")),
                         )
                     )
@@ -134,6 +140,7 @@ def _result_to_payload(result: TranscriptionResult) -> dict[str, object]:
         "language": result.language,
         "warnings": result.warnings,
         "segments": [segment.to_api() for segment in result.segments],
+        "timestamps": [item.to_api() for item in result.timestamps],
         "timings": {
             "total_ms": result.timings.total_ms,
             "load_ms": result.timings.load_ms,
@@ -142,12 +149,14 @@ def _result_to_payload(result: TranscriptionResult) -> dict[str, object]:
             "postprocess_ms": result.timings.postprocess_ms,
         },
         "generation": result.generation.to_api(),
+        "context": result.context.to_api(),
     }
 
 
 def _result_from_payload(payload: Any) -> TranscriptionResult:
     timings = payload.get("timings", {})
     generation = payload.get("generation", {})
+    context = payload.get("context", {})
     return TranscriptionResult(
         text=str(payload["text"]),
         duration=float(payload["duration"]),
@@ -159,8 +168,29 @@ def _result_from_payload(payload: Any) -> TranscriptionResult:
                 end=float(segment["end"]),
                 speaker=str(segment["speaker"]) if segment.get("speaker") is not None else None,
                 text=str(segment["text"]),
+                source_speaker=(
+                    str(segment["source_speaker"])
+                    if segment.get("source_speaker") is not None
+                    else None
+                ),
+                speaker_resolution=(
+                    str(segment["speaker_resolution"])
+                    if segment.get("speaker_resolution") is not None
+                    else None
+                ),
             )
             for segment in payload.get("segments", [])
+        ],
+        timestamps=[
+            TimestampItem(
+                text=str(item["text"]),
+                start=float(item["start"]),
+                end=float(item["end"]),
+                granularity=str(item["granularity"]),
+                source=str(item.get("source", "unknown")),
+                status=str(item.get("status", "aligned")),
+            )
+            for item in payload.get("timestamps", [])
         ],
         timings=TranscriptionTimings(
             total_ms=float(timings.get("total_ms", 0.0)),
@@ -176,6 +206,20 @@ def _result_from_payload(payload: Any) -> TranscriptionResult:
             peak_vram_allocated_mb=_optional_float(generation.get("peak_vram_allocated_mb")),
             segment_coverage_end_seconds=_optional_float(generation.get("segment_coverage_end_seconds")),
             segment_coverage_ratio=_optional_float(generation.get("segment_coverage_ratio")),
+            audible_speech_end_seconds=_optional_float(generation.get("audible_speech_end_seconds")),
+            uncovered_speech_intervals=_optional_int(generation.get("uncovered_speech_intervals")),
+            truncated=bool(generation.get("truncated", False)),
+            finish_reason=str(generation["finish_reason"]) if generation.get("finish_reason") is not None else None,
+        ),
+        context=ContextApplication(
+            requested=bool(context.get("requested", False)),
+            applied=bool(context.get("applied", False)),
+            method=str(context["method"]) if context.get("method") is not None else None,
+            input_chars=int(context.get("input_chars", 0)),
+            used_chars=int(context.get("used_chars", 0)),
+            hotword_count=int(context.get("hotword_count", 0)),
+            truncated=bool(context.get("truncated", False)),
+            ignored_reason=str(context["ignored_reason"]) if context.get("ignored_reason") is not None else None,
         ),
     )
 
@@ -250,7 +294,8 @@ class MossTranscribeDiarizeAdapter:
         backend: str,
         language: str,
         context: str,
-        max_new_tokens: int | None,
+        timestamps: str = "none",
+        max_new_tokens: int | None = None,
     ) -> TranscriptionResult:
         del model_id, backend
         payload = self._request(
@@ -259,6 +304,7 @@ class MossTranscribeDiarizeAdapter:
             audio=audio,
             language=language,
             context=context,
+            timestamps=timestamps,
             max_new_tokens=max_new_tokens,
         )
         return _result_from_payload(payload)
@@ -271,7 +317,8 @@ class MossTranscribeDiarizeAdapter:
         backend: str,
         language: str,
         context: str,
-        max_new_tokens: int | None,
+        timestamps: str = "none",
+        max_new_tokens: int | None = None,
     ) -> list[TranscriptionResult]:
         del model_id, backend
         payload = self._request(
@@ -280,6 +327,7 @@ class MossTranscribeDiarizeAdapter:
             audio_chunks=audio_chunks,
             language=language,
             context=context,
+            timestamps=timestamps,
             max_new_tokens=max_new_tokens,
         )
         return [_result_from_payload(item) for item in payload]
@@ -373,9 +421,10 @@ class _MossWorkerBackend:
         backend: str,
         language: str,
         context: str,
-        max_new_tokens: int | None,
+        timestamps: str = "none",
+        max_new_tokens: int | None = None,
     ) -> TranscriptionResult:
-        del model_id, backend
+        del model_id, backend, timestamps
         model = self._model
         processor = self._processor
         helpers = self._helpers
@@ -425,13 +474,23 @@ class _MossWorkerBackend:
                 )
             postprocess_started = perf_counter()
             if not raw_text.strip():
-                raise AsrError(503, "inference_failed", "MOSS returned an empty transcription result")
+                raise AsrError(422, "empty_transcription", "MOSS returned an empty transcription result")
             segments, parse_warnings = self._parse_segments(raw_text, helpers, audio_duration_seconds(audio))
             text = "\n".join(segment.text for segment in segments) if segments else raw_text
             duration = audio_duration_seconds(audio)
             coverage_end = max((segment.end for segment in segments), default=None)
             coverage_ratio = min(coverage_end / duration, 1.0) if coverage_end is not None and duration > 0 else None
-            self._validate_tail_coverage(duration=duration, coverage_end=coverage_end)
+            speech_intervals = _energy_intervals_path(
+                audio_path,
+                inspect_audio_path(audio_path),
+                padding_seconds=0.0,
+            )
+            audible_end, uncovered_speech = self._validate_speech_coverage(
+                duration=duration,
+                coverage_end=coverage_end,
+                segments=segments,
+                speech_intervals=speech_intervals,
+            )
             postprocess_ms = (perf_counter() - postprocess_started) * 1000
             return TranscriptionResult(
                 text=text,
@@ -450,6 +509,15 @@ class _MossWorkerBackend:
                     peak_vram_allocated_mb=peak_vram_allocated_mb,
                     segment_coverage_end_seconds=coverage_end,
                     segment_coverage_ratio=coverage_ratio,
+                    audible_speech_end_seconds=audible_end,
+                    uncovered_speech_intervals=uncovered_speech,
+                ),
+                context=ContextApplication(
+                    requested=bool(context),
+                    applied=bool(context),
+                    method="moss_transcription_prompt" if context else None,
+                    input_chars=len(context),
+                    used_chars=len(context),
                 ),
             )
     async def transcribe_batch(
@@ -460,7 +528,8 @@ class _MossWorkerBackend:
         backend: str,
         language: str,
         context: str,
-        max_new_tokens: int | None,
+        timestamps: str = "none",
+        max_new_tokens: int | None = None,
     ) -> list[TranscriptionResult]:
         results = []
         for audio in audio_chunks:
@@ -471,6 +540,7 @@ class _MossWorkerBackend:
                     backend=backend,
                     language=language,
                     context=context,
+                    timestamps=timestamps,
                     max_new_tokens=max_new_tokens,
                 )
             )
@@ -586,24 +656,56 @@ class _MossWorkerBackend:
         return value if isinstance(value, int) else None
 
     def _validate_tail_coverage(self, *, duration: float, coverage_end: float | None) -> None:
-        if coverage_end is None or duration <= 0:
-            return
-        uncovered_tail = max(duration - coverage_end, 0.0)
-        allowed_tail = max(60.0, duration * 0.02)
-        if uncovered_tail <= allowed_tail:
-            return
-        raise AsrError(
-            422,
-            "incomplete_transcript",
-            "MOSS stopped before covering the end of the audio",
-            {
-                "audio_duration_seconds": duration,
-                "last_segment_end_seconds": coverage_end,
-                "uncovered_tail_seconds": uncovered_tail,
-                "allowed_tail_seconds": allowed_tail,
-                "recommended_action": "retry with split_strategy=fixed and a validated chunk duration",
-            },
+        self._validate_speech_coverage(
+            duration=duration,
+            coverage_end=coverage_end,
+            segments=[],
+            speech_intervals=[],
         )
+
+    def _validate_speech_coverage(
+        self,
+        *,
+        duration: float,
+        coverage_end: float | None,
+        segments: list[TranscriptionSegment],
+        speech_intervals: list[tuple[float, float]],
+    ) -> tuple[float | None, int]:
+        if coverage_end is None or duration <= 0:
+            return (speech_intervals[-1][1] if speech_intervals else None), len(speech_intervals)
+        audible_end = speech_intervals[-1][1] if speech_intervals else duration
+        uncovered_tail = max(audible_end - coverage_end, 0.0)
+        allowed_tail = max(60.0, duration * 0.02)
+        uncovered_intervals = (
+            [
+                (start, end)
+                for start, end in speech_intervals
+                if not any(segment.start < end and segment.end > start for segment in segments)
+            ]
+            if segments
+            else []
+        )
+        if uncovered_tail > allowed_tail or uncovered_intervals:
+            raise AsrError(
+                422,
+                "incomplete_transcript",
+                "MOSS output did not cover candidate audible intervals",
+                {
+                    "audio_duration_seconds": duration,
+                    "audible_speech_end_seconds": audible_end,
+                    "last_segment_end_seconds": coverage_end,
+                    "uncovered_tail_seconds": uncovered_tail,
+                    "allowed_tail_seconds": allowed_tail,
+                    "uncovered_speech_intervals": [
+                        {"start": start, "end": end} for start, end in uncovered_intervals[:20]
+                    ],
+                    "uncovered_speech_interval_count": len(uncovered_intervals),
+                    "coverage_evidence": "energy_activity_not_speech_classification",
+                    "coverage_is_not_accuracy": True,
+                    "recommended_action": "retry with split_strategy=fixed and a validated chunk duration",
+                },
+            )
+        return audible_end, 0
 
     def _reset_peak_memory_stats(self) -> None:
         cuda = getattr(self._torch, "cuda", None)
