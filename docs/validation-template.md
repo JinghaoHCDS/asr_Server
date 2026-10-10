@@ -1,10 +1,12 @@
 # WSL ASR 验收记录模板
 
+部署路径和 LAN IP 由用户环境决定；示例 `YOUR_WINDOWS_LAN_IP` 与 `/path/to/` 必须替换。历史 Mac / Arch 验收不代表其他平台已实测。
+
 ## 环境
 
 - 日期：
 - WSL 发行版：
-- 项目路径：`/home/fragt/services/asr-server`
+- 项目路径：`~/services/asr-server`
 - Git commit：
 - Python 版本：
 - uv 版本：
@@ -74,7 +76,7 @@
 
 ## 长音频切分与合并
 
-- 使用音频文件：`test-fixtures/audio/test_long.mp3`
+- 使用音频文件：`/path/to/your-long-audio.mp3`
 - 切分策略：
 - VAD backend：
 - chunk 数量：
@@ -95,7 +97,7 @@
 - 短音频 job backend：
 - 短音频 job 最终状态：
 - 短音频 job 文本前 200 字：
-- 长音频 job 使用音频：`test-fixtures/audio/test_long.mp3`
+- 长音频 job 使用音频：`/path/to/your-long-audio.mp3`
 - 长音频 job 模型 ID：
 - 长音频 job backend：
 - 长音频 job 状态流转时间线：
@@ -152,7 +154,7 @@
 
 ## Qwen batch transcription 验收
 
-- 测试音频：`test-fixtures/audio/test_long.mp3`
+- 测试音频：`/path/to/your-long-audio.mp3`
 - batch size 1 总耗时：
 - batch size 2 总耗时：
 - batch size 4 总耗时：
@@ -178,8 +180,8 @@
 ## Mac 局域网验收
 
 - Mac 请求是否绕过代理：
-- `curl --noproxy '*' http://192.168.31.137:18080/health` 结果：
-- `curl --noproxy '*' http://192.168.31.137:18080/v1/models` 结果：
+- `curl --noproxy '*' http://YOUR_WINDOWS_LAN_IP:18080/health` 结果：
+- `curl --noproxy '*' http://YOUR_WINDOWS_LAN_IP:18080/v1/models` 结果：
 - Mac 上传真实音频转录摘要：
 - Mac MOSS verbose_json 摘要：
 - Mac 创建 job 请求摘要：

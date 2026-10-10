@@ -172,7 +172,7 @@ class JobManager:
             for job_id in queued_ids:
                 job = self._jobs.get(job_id)
                 if job is not None:
-                    self._mark_cancelled(job)
+                    job.status = "cancel_requested"
             for job in self._jobs.values():
                 if job.id not in queued_ids and job.status not in TERMINAL_STATUSES:
                     job.status = "cancel_requested"
@@ -180,7 +180,7 @@ class JobManager:
         for job_id in queued_ids:
             job = self._jobs.get(job_id)
             if job is not None:
-                await self._cleanup_job_files(job)
+                await self._cleanup_cancelled_job(job)
         if self._worker is not None:
             done, _pending = await asyncio.wait(
                 {self._worker},
@@ -303,8 +303,7 @@ class JobManager:
                     self._queue.remove(job_id)
                 except ValueError:
                     pass
-                self._mark_cancelled(job)
-                await self._cleanup_job_files(job)
+                await self._cleanup_cancelled_job(job)
                 self._condition.notify()
                 return {"id": job.id, "status": job.status, "message": "job cancelled"}
             if job.status in TERMINAL_STATUSES:
@@ -344,6 +343,10 @@ class JobManager:
         job.started_at = utc_now()
         job.status = "preprocessing"
         job.progress = JobProgress(phase="preprocessing", percent=1.0, message="preprocessing uploaded audio")
+        final_status: Literal["completed", "failed", "cancelled"] = "cancelled"
+        result: dict[str, object] | None = None
+        error: dict[str, object] | None = None
+        worker_cancelled = False
         try:
             async def stage_callback(phase: str, update: dict[str, object]) -> None:
                 self._raise_if_cancel_requested(job)
@@ -398,31 +401,44 @@ class JobManager:
                 before_chunk=before_chunk,
                 after_chunk=after_chunk,
             )
+            self._raise_if_cancel_requested(job)
+            final_status = "completed"
         except JobCancelled:
-            self._mark_cancelled(job)
+            final_status = "cancelled"
+        except asyncio.CancelledError:
+            job.status = "cancel_requested"
+            worker_cancelled = True
         except AsrError as exc:
-            job.status = "failed"
-            job.completed_at = utc_now()
-            job.expires_at = job.completed_at + timedelta(seconds=self._settings.job_result_ttl_seconds)
-            job.progress.phase = "failed"
-            job.error = {"code": exc.code, "message": exc.message, "details": exc.details}
+            final_status = "failed"
+            error = {"code": exc.code, "message": exc.message, "details": exc.details}
         except Exception as exc:
-            job.status = "failed"
-            job.completed_at = utc_now()
-            job.expires_at = job.completed_at + timedelta(seconds=self._settings.job_result_ttl_seconds)
-            job.progress.phase = "failed"
-            job.error = {
+            final_status = "failed"
+            error = {
                 "code": "inference_failed",
                 "message": "transcription job failed",
                 "details": {"error_type": type(exc).__name__},
             }
+        finally:
+            try:
+                await self._cleanup_job_files(job)
+            except asyncio.CancelledError:
+                # AudioWorkspace completes deletion and budget release before
+                # propagating cancellation to its caller.
+                job.status = "cancel_requested"
+                worker_cancelled = True
+        if job.status == "cancel_requested":
+            final_status = "cancelled"
+        if final_status == "cancelled":
+            self._mark_cancelled(job)
+        elif final_status == "failed":
+            job.error = error
+            self._mark_terminal(job, "failed")
         else:
-            job.status = "completed"
+            assert result is not None
             job.result = result
             split = result.get("split")
             job.split = split if isinstance(split, dict) else None
-            job.completed_at = utc_now()
-            job.expires_at = job.completed_at + timedelta(seconds=self._settings.job_result_ttl_seconds)
+            self._mark_terminal(job, "completed")
             split_count = _int_from_progress(job.progress.total_chunks)
             job.progress = JobProgress(
                 phase="completed",
@@ -430,9 +446,9 @@ class JobManager:
                 total_chunks=split_count,
                 completed_chunks=split_count,
             )
-        finally:
-            await self._cleanup_job_files(job)
-            logger.info("finished transcription job id=%s status=%s", job.id, job.status)
+        logger.info("finished transcription job id=%s status=%s", job.id, job.status)
+        if worker_cancelled:
+            raise asyncio.CancelledError
 
     def _raise_if_cancel_requested(self, job: TranscriptionJob) -> None:
         if job.status == "cancel_requested":
@@ -475,11 +491,27 @@ class JobManager:
         )
 
     def _mark_cancelled(self, job: TranscriptionJob) -> None:
-        job.status = "cancelled"
+        self._mark_terminal(job, "cancelled")
+        job.progress.message = "job cancelled"
+
+    def _mark_terminal(
+        self,
+        job: TranscriptionJob,
+        status: Literal["completed", "failed", "cancelled"],
+    ) -> None:
+        job.status = status
         job.completed_at = utc_now()
         job.expires_at = job.completed_at + timedelta(seconds=self._settings.job_result_ttl_seconds)
-        job.progress.phase = "cancelled"
-        job.progress.message = "job cancelled"
+        job.progress.phase = status
+
+    async def _cleanup_cancelled_job(self, job: TranscriptionJob) -> None:
+        job.status = "cancel_requested"
+        try:
+            await self._cleanup_job_files(job)
+        except asyncio.CancelledError:
+            self._mark_cancelled(job)
+            raise
+        self._mark_cancelled(job)
 
     def _job_create_payload(self, job: TranscriptionJob) -> dict[str, object]:
         return {

@@ -1,7 +1,0 @@
-name: asr-server
-channels:
-  - conda-forge
-dependencies:
-  - python=3.12
-  - uv=0.7.6
-

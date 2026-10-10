@@ -2,21 +2,13 @@
 
 ## 项目背景
 
-这个仓库用于实现一个局域网 ASR 网关：Mac mini 客户端通过 HTTP 调用运行在 Windows WSL Arch Linux 内的 GPU ASR 服务。
+这个仓库提供局域网 ASR 服务：Windows 主机的 NVIDIA GPU 在 WSL 中运行 Qwen3-ASR 与可选 MOSS，供局域网 Agent、应用和脚本通过 HTTP 或客户端 stdio MCP bridge 使用。
 
-主要部署目录：
+产品部署默认使用当前 WSL checkout，推荐克隆到 `~/services/asr-server`，不要放在 `/mnt/c`。HTTP 客户端和 MCP 默认地址为 `http://127.0.0.1:18080`；远端 Agent 必须显式配置 Windows 主机的局域网地址。
 
-```text
-/home/fragt/services/asr-server
-```
+历史已验收环境是 WSL2 Arch Linux + RTX 5070 Ti 16GB，原部署 `/home/fragt/services/asr-server`、原入口 `http://192.168.31.137:18080` 仅作为历史验证信息。不得把它们硬编码为新用户的运行前提。Ubuntu 依赖说明不等于已完成对应实机验收。
 
-局域网公开入口：
-
-```text
-http://192.168.31.137:18080
-```
-
-Mac mini 只作为轻量开发机和客户端验收机。真实 GPU 推理、CUDA 验证、模型包安装、长期后台服务部署，都必须在 Windows PC 的 WSL Arch Linux 内完成。
+Mac mini 和其他客户端只承担轻量开发与客户端验收。真实 GPU 推理、CUDA 验证、模型包安装、长期后台部署必须在 Windows PC 的 WSL 环境内完成；当前验收主路径仍为 WSL Arch Linux。
 
 ## 必读文档
 
@@ -38,7 +30,7 @@ prompts/request-client-agent.md
 - 公共 API 必须和 `docs/asr-server-prd.md` 保持一致。
 - 使用 Python 3.12、uv、FastAPI 和 Uvicorn 实现服务。
 - 服务入口监听 `0.0.0.0:18080`。
-- WSL 项目位置不要放在 `/mnt/c`；正式部署目录是 `/home/fragt/services/asr-server`。
+- WSL 项目位置不要放在 `/mnt/c`；推荐部署到 `~/services/asr-server`，部署脚本默认当前 checkout。
 - 除非 PRD 明确变更，不要把 worker 端口 `8001` 暴露到局域网。
 - 不要把历史测试端口 `8765` 写入实现、部署、防火墙或启动配置。
 - API、生命周期管理、测试和第一条转录路径完成前，不要做 Web UI。
@@ -69,7 +61,7 @@ WSL 侧安装真实 Qwen3-ASR 前，必须先把 RTX 5070 Ti 的 PyTorch CUDA �
 推荐 WSL 安装顺序：
 
 ```bash
-cd /home/fragt/services/asr-server
+cd ~/services/asr-server
 
 uv python install 3.12
 uv sync
@@ -166,8 +158,10 @@ MOSS Anchor Replay 在调用方未显式传 `max_new_tokens` 时使用至少 `24
 ## 网络与安全
 
 - 唯一面向局域网的 API 端口是 `18080`。
-- Mac 客户端请求 `192.168.31.137` 时必须绕过本机代理，例如使用 `curl --noproxy '*'`。
-- 支持可选 Bearer Token 鉴权，但不要假设服务会暴露到公网。
+- 客户端请求 Windows 主机的 LAN 地址时必须绕过本机代理，例如使用 `curl --noproxy '*'`。
+- `ASR_API_TOKEN` 启用可选 Bearer 鉴权，保护 `/v1/**`；`/health` 和文档保持公开。CLI 使用 `ASR_TOKEN`，MCP 使用 `ASR_MCP_TOKEN`，不得打印或提交真实 token。
+- `.env` 由部署生成的 systemd unit 读取；直接 Python 启动和 MCP 不会自动加载它。
+- 不要假设服务会暴露到公网。
 - 不要添加公网隧道、端口映射或互联网暴露。
 - 上传音频应写入临时位置，并在推理结束后清理。
 - 日志默认不要保存完整音频内容。

@@ -1,7 +1,7 @@
 [project]
 name = "asr-server"
 version = "0.1.0"
-description = "Local-network ASR gateway for Qwen3-ASR running in WSL Arch Linux."
+description = "LAN ASR service for Agents, powered by Qwen3-ASR and MOSS on NVIDIA GPUs in Windows WSL."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

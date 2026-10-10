@@ -59,7 +59,7 @@ async def test_docs_endpoint_uses_current_capability_notes(client: AsyncClient) 
     assert "[Open the MCP setup tutorial](/docs/mcp)" in description
     assert mcp_tutorial_response.status_code == 200
     assert mcp_tutorial_response.headers["content-type"].startswith("text/markdown")
-    assert "# Mac 侧 MCP Bridge" in mcp_tutorial_response.text
+    assert "# Agent 侧 MCP Bridge" in mcp_tutorial_response.text
     assert "python -m asr_mcp.server" in mcp_tutorial_response.text
 
 

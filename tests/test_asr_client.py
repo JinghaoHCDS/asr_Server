@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from scripts.asr_client import choose_backend, choose_fallback_model, choose_model_for_purpose
+from scripts.asr_client import choose_backend, choose_fallback_model, choose_model_for_purpose, make_client
 
 
 MODELS = [
@@ -51,3 +51,9 @@ def test_purpose_selection_requires_discovered_capabilities() -> None:
     assert choose_model_for_purpose(models, "podcast", None) == "podcast"
     with pytest.raises(RuntimeError):
         choose_model_for_purpose(models, "oral_analysis", "podcast")
+
+
+def test_client_sends_configured_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ASR_TOKEN", "test-secret")
+    with make_client(30.0) as client:
+        assert client.headers["Authorization"] == "Bearer test-secret"

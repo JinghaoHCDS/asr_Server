@@ -14,7 +14,7 @@ from typing import Any, Protocol
 import httpx
 
 
-DEFAULT_BASE_URL = "http://192.168.31.137:18080"
+DEFAULT_BASE_URL = "http://127.0.0.1:18080"
 TERMINAL = {"completed", "failed", "cancelled"}
 _SAFE_ID = re.compile(r"[^A-Za-z0-9._-]+")
 

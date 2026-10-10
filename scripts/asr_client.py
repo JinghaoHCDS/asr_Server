@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -9,14 +10,16 @@ from typing import Any
 import httpx
 
 
-DEFAULT_BASE_URL = "http://192.168.31.137:18080"
+DEFAULT_BASE_URL = "http://127.0.0.1:18080"
 DEFAULT_MODEL = "qwen3-asr-1.7b"
 FALLBACK_MODEL = "qwen3-asr-0.6b"
 
 
 def make_client(timeout_seconds: float) -> httpx.Client:
     timeout = httpx.Timeout(connect=5.0, read=timeout_seconds, write=30.0, pool=5.0)
-    return httpx.Client(timeout=timeout, trust_env=False)
+    token = os.getenv("ASR_TOKEN")
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    return httpx.Client(timeout=timeout, trust_env=False, headers=headers)
 
 
 def response_error_code(response: httpx.Response) -> str | None:

@@ -1,14 +1,14 @@
-# Mac 侧 MCP Bridge
+# Agent 侧 MCP Bridge
 
-第一版 MCP 支持运行在 Mac 客户端，通过 stdio 向 MCP Host 提供工具，再使用现有 HTTP API 把音频上传到 WSL ASR Gateway。它不运行模型、不安装 CUDA，也不新增局域网端口。
+MCP bridge 运行在 Agent 所在客户端（已实机验证 Mac；其他平台尚待验收），通过 stdio 向 MCP Host 提供工具，再使用现有 HTTP API 把音频上传到 WSL ASR Gateway。它不运行模型、不安装 CUDA，也不新增局域网端口。
 
 ```text
-MCP Host -> stdio -> Mac ASR MCP Bridge -> HTTP :18080 -> WSL GPU ASR
+MCP Host -> stdio -> Local ASR MCP Bridge -> HTTP :18080 -> WSL GPU ASR
 ```
 
 ## 安装
 
-在 Mac 仓库目录执行：
+在客户端仓库目录执行：
 
 ```bash
 uv sync --extra mcp
@@ -22,8 +22,8 @@ Bridge 读取以下环境变量：
 
 | 变量 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `ASR_MCP_BASE_URL` | 否 | `http://192.168.31.137:18080` | WSL ASR Gateway 地址 |
-| `ASR_MCP_ALLOWED_ROOTS` | 是 | 无 | 允许读取音频的本地目录；macOS 用 `:` 分隔多个目录 |
+| `ASR_MCP_BASE_URL` | 否 | `http://127.0.0.1:18080` | WSL ASR Gateway 地址 |
+| `ASR_MCP_ALLOWED_ROOTS` | 是 | 无 | 允许读取音频的本地目录；POSIX 用 `:`、原生 Windows 用 `;` 分隔多个目录 |
 | `ASR_MCP_TOKEN` | 否 | 无 | 发送给 ASR Gateway 的 Bearer Token |
 | `ASR_MCP_MAX_FILE_MB` | 否 | `512` | bridge 侧上传大小上限 |
 | `ASR_MCP_REQUEST_TIMEOUT_SECONDS` | 否 | `3600` | HTTP read timeout |
@@ -52,7 +52,7 @@ Bridge 读取以下环境变量：
         "asr_mcp.server"
       ],
       "env": {
-        "ASR_MCP_BASE_URL": "http://192.168.31.137:18080",
+        "ASR_MCP_BASE_URL": "http://YOUR_WINDOWS_LAN_IP:18080",
         "ASR_MCP_ALLOWED_ROOTS": "/Users/your-name/Downloads:/Users/your-name/Desktop/audio"
       }
     }
@@ -82,7 +82,7 @@ Bridge 读取以下环境变量：
 先确认 HTTP 服务可达：
 
 ```bash
-curl --noproxy '*' http://192.168.31.137:18080/health
+curl --noproxy '*' http://YOUR_WINDOWS_LAN_IP:18080/health
 ```
 
 然后启动 MCP Inspector，并把 stdio command 配置为：
@@ -101,7 +101,7 @@ uv run --directory /Users/your-name/path/to/asr_Server --extra mcp python -m asr
 
 ## 当前边界
 
-- MCP bridge 只运行在 Mac 侧 stdio，不在 WSL FastAPI 中挂载远程 `/mcp`。
+- MCP bridge 运行在客户端 stdio，不在 WSL FastAPI 中挂载远程 `/mcp`。
 - MCP 不替代现有 REST API；REST 和 `/v1/models` 仍是公共合约与能力真相来源。
 - 不使用 base64 传大音频，也不接受任意远程音频 URL。
 - 不新增 `8001`、`8765` 或其他局域网端口。

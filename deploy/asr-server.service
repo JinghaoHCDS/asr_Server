@@ -5,12 +5,12 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/fragt/services/asr-server
-Environment=ASR_HOST=0.0.0.0
-Environment=ASR_PORT=18080
-Environment=ASR_ADAPTER=qwen
-Environment=ASR_QWEN_BATCH_SIZE=1
-Environment=ASR_IDLE_UNLOAD_SECONDS=180
+WorkingDirectory="@PROJECT_DIR@"
+Environment=ASR_HOST=@HOST@
+Environment=ASR_PORT=@PORT@
+Environment=ASR_ADAPTER=@ADAPTER@
+Environment=ASR_QWEN_BATCH_SIZE=@QWEN_BATCH_SIZE@
+Environment=ASR_IDLE_UNLOAD_SECONDS=@IDLE_UNLOAD_SECONDS@
 Environment=ASR_WORKER_STARTUP_TIMEOUT_SECONDS=30
 Environment=ASR_WORKER_LOAD_TIMEOUT_SECONDS=900
 Environment=ASR_WORKER_INFERENCE_TIMEOUT_SECONDS=3600
@@ -20,9 +20,12 @@ Environment=ASR_MIN_FREE_DISK_MB=5120
 Environment=ASR_MAX_SPOOL_MB=12288
 Environment=ASR_MAX_WORKSPACE_MB=1280
 Environment=ASR_MAX_WORKSPACE_FILES=8
-Environment=HF_HUB_OFFLINE=1
-Environment=TRANSFORMERS_OFFLINE=1
-ExecStart=/home/fragt/services/asr-server/.venv/bin/uvicorn asr_server.main:app --host 0.0.0.0 --port 18080
+Environment=ASR_ENABLE_MOSS=0
+Environment=ASR_ENABLE_QWEN_ALIGNMENT=0
+Environment=HF_HUB_OFFLINE=@HF_HUB_OFFLINE@
+Environment=TRANSFORMERS_OFFLINE=@TRANSFORMERS_OFFLINE@
+EnvironmentFile=-"@PROJECT_DIR@/.env"
+ExecStart="@UVICORN@" asr_server.main:app --host @HOST@ --port @PORT@
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=60

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, cast
 
 AdapterMode = Literal["mock", "qwen"]
@@ -11,7 +11,8 @@ AdapterMode = Literal["mock", "qwen"]
 class Settings:
     host: str = "0.0.0.0"
     port: int = 18080
-    public_base_url: str = "http://192.168.31.137:18080"
+    public_base_url: str = "http://127.0.0.1:18080"
+    api_token: str | None = field(default=None, repr=False)
     default_model: str = "qwen3-asr-1.7b"
     adapter: AdapterMode = "mock"
     enable_moss: bool = False
@@ -72,7 +73,8 @@ def load_settings() -> Settings:
     return Settings(
         host=os.getenv("ASR_HOST", "0.0.0.0"),
         port=int(os.getenv("ASR_PORT", "18080")),
-        public_base_url=os.getenv("ASR_PUBLIC_BASE_URL", "http://192.168.31.137:18080"),
+        public_base_url=os.getenv("ASR_PUBLIC_BASE_URL", "http://127.0.0.1:18080"),
+        api_token=os.getenv("ASR_API_TOKEN") or None,
         default_model=os.getenv("ASR_DEFAULT_MODEL", "qwen3-asr-1.7b"),
         adapter=adapter_mode,
         enable_moss=enable_moss,

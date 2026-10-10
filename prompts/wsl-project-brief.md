@@ -1,21 +1,23 @@
 # WSL 侧代理项目总览提示词
 
+部署路径和 LAN IP 由用户环境决定；示例 `YOUR_WINDOWS_LAN_IP` 与 `/path/to/` 必须替换。历史 Mac / Arch 验收不代表其他平台已实测。
+
 你是在 Windows PC 的 WSL Arch Linux 内接手这个项目的开发代理。请先用这份总览理解项目，再阅读细节文档。
 
 ## 你要完成什么
 
-这个项目是一个局域网 ASR 网关。Mac mini 本地项目通过 HTTP 上传音频，WSL Arch Linux 内的服务使用 Windows PC 上的 RTX 5070 Ti GPU 跑 Qwen3-ASR；在 MOSS gate 开启后，也可以调用 MOSS-Transcribe-Diarize 返回段级说话人结果。
+这个项目是一个局域网 ASR 网关。局域网 Agent 客户端项目通过 HTTP 上传音频，WSL Arch Linux 内的服务使用 Windows PC 上的 RTX 5070 Ti GPU 跑 Qwen3-ASR；在 MOSS gate 开启后，也可以调用 MOSS-Transcribe-Diarize 返回段级说话人结果。
 
 最终服务入口：
 
 ```text
-http://192.168.31.137:18080
+http://YOUR_WINDOWS_LAN_IP:18080
 ```
 
 WSL 内项目目录：
 
 ```text
-/home/fragt/services/asr-server
+~/services/asr-server
 ```
 
 不要把项目部署在 `/mnt/c`。不要使用历史测试端口 `8765`。
@@ -40,7 +42,7 @@ Mac 侧已经提前做好了这些不依赖 GPU 的工作：
 - MOSS 后端最小验收脚本：`scripts/moss_backend_smoke.py`
 - WSL 部署文档：`docs/wsl-deployment.md`
 - 验收记录模板：`docs/validation-template.md`
-- 测试音频：`test-fixtures/audio/test_short.wav` 和 `test-fixtures/audio/test_long.mp3`
+- 测试音频：`test-fixtures/audio/test_short.wav` 和 `/path/to/your-long-audio.mp3`
 
 Mac 侧代码默认使用 `ASR_ADAPTER=mock`，不会加载真实模型。WSL 真实部署时使用：
 
@@ -153,7 +155,7 @@ MOSS `auto` 在已验证的 30 分钟级窗口内使用 native long-form，超�
 
 建议执行顺序：
 
-1. 在 `/home/fragt/services/asr-server` 准备项目。
+1. 在 `~/services/asr-server` 准备项目。
 2. `uv sync`
 3. `uv run pytest -q`
 4. `uv run mypy asr_server tests scripts`
@@ -423,7 +425,7 @@ expired
 不要删除现有同步接口。当前推荐行为：
 
 - 小于等于 10 分钟的音频：同步接口继续允许 `200 OK` 返回完整结果。
-- 超过 10 分钟的音频：同步接口不要长时间阻塞；建议创建 job 并返回 `202 Accepted`，响应里给出 `job_id` 和 `status_url`。
+- 超过 10 分钟的音频：同步接口不要长时间阻塞；建议创建 job 并返回 `202 Accepted`，响应里给出 `id` 和 `status_url`。
 - 如果暂时不想让同步接口自动创建 job，也可以返回 `422 duration_limit_exceeded` 并在 details 中提示使用 `/v1/audio/transcription-jobs`。但优先实现自动创建 job，更符合 PRD。
 - job 接口不受 10 分钟同步阈值限制，但仍受单文件 6 小时和服务端上传大小限制。
 
@@ -514,14 +516,14 @@ ASR_ADAPTER=qwen uv run uvicorn asr_server.main:app --host 0.0.0.0 --port 18080
 ```
 
 5. 用 `test-fixtures/audio/test_short.wav` 创建 job，轮询到 `completed`，记录 `result.text` 前 200 字。
-6. 用 `test-fixtures/audio/test_long.mp3` 创建 job，轮询过程中至少记录三次状态：queued 或 preprocessing、transcribing 中间状态、completed。
+6. 用 `/path/to/your-long-audio.mp3` 创建 job，轮询过程中至少记录三次状态：queued 或 preprocessing、transcribing 中间状态、completed。
 7. 验证 `progress.total_chunks`、`completed_chunks`、`current_chunk` 在长音频转录中真实变化。
 8. 分别对 `qwen3-asr-0.6b` 和 `qwen3-asr-1.7b` 跑一次 job API，后端均为 `transformers`，返回非空文本。
 9. 从 Mac mini 通过局域网入口请求：
 
 ```bash
-curl --noproxy '*' http://192.168.31.137:18080/health
-curl --noproxy '*' http://192.168.31.137:18080/v1/models
+curl --noproxy '*' http://YOUR_WINDOWS_LAN_IP:18080/health
+curl --noproxy '*' http://YOUR_WINDOWS_LAN_IP:18080/v1/models
 ```
 
 10. 从 Mac mini 创建一个 job 并轮询 `GET /v1/jobs/{job_id}` 到 completed，证明进度不是只在 WSL localhost 可见。
@@ -567,5 +569,13 @@ curl --noproxy '*' http://192.168.31.137:18080/v1/models
 - `qwen3-asr-0.6b` 和 `qwen3-asr-1.7b` 的服务端 API 转录结果。
 - 如果启用 MOSS，`moss-transcribe-diarize-0.9b` 的 `verbose_json` segments 转录结果。
 - `/health` 和 `/v1/models` 的响应摘要。
-- Mac mini 是否能通过 `http://192.168.31.137:18080` 调用服务。
+- Mac mini 是否能通过 `http://YOUR_WINDOWS_LAN_IP:18080` 调用服务。
 - 如果失败，给出具体命令、错误日志和下一步判断。
+
+## 当前 job / 能力与鉴权合约
+
+创建响应的任务标识字段是 `id`，路径中的 `{job_id}` 使用该值。轮询使用 `detail=compact`；completed 后请求一次 `detail=full` 读取 `result.text`。如需已完成 chunk 的文字，也使用 full。任务在内存中保存，重启后丢失，不能承诺服务端断点续算。
+
+使用 `purpose=podcast` 时，REST 必须显式选择已声明的 MOSS 模型；它不会自动从默认 Qwen 切换模型。读取 `diarization.status` 和 `speaker_scope`，保留 partial / mixed / unresolved；4–5 小时整期一致性仍未完成完整实测。
+
+启用 `ASR_API_TOKEN` 时，所有 `/v1/**` 请求提供 Bearer 凭据；客户端 CLI 用 `ASR_TOKEN`，MCP 用 `ASR_MCP_TOKEN`。`.env` 只有部署生成的 systemd unit 会读取，客户端和直接 Python 启动不自动加载。

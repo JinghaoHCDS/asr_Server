@@ -4,6 +4,7 @@ import io
 import wave
 import struct
 import threading
+import subprocess
 from array import array
 from pathlib import Path
 
@@ -14,9 +15,6 @@ from asr_server.audio.metadata import AudioMetadata
 from asr_server.audio.preprocess import normalize_audio_to_wav
 from asr_server.audio.splitter import SplitCancelled, split_audio, split_audio_path
 from asr_server.errors import AsrError
-
-
-LONG_MP3_FIXTURE = Path("test-fixtures/audio/test_long.mp3")
 
 
 def make_wav(duration_seconds: float, sample_rate: int = 8_000) -> bytes:
@@ -243,13 +241,24 @@ def test_duration_limit_is_enforced_before_sync_transcription(monkeypatch: pytes
     assert exc_info.value.details["max_audio_seconds_per_file"] == 21_600.0
 
 
-def test_long_mp3_fixture_is_preprocessed_and_energy_split(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_generated_mp3_is_preprocessed_and_energy_split(monkeypatch: pytest.MonkeyPatch) -> None:
     def unavailable(*args: object, **kwargs: object) -> list[tuple[float, float]]:
         raise splitter_module._SileroUnavailable("test unavailable")
 
     monkeypatch.setattr(splitter_module, "_silero_intervals", unavailable)
 
-    normalized = normalize_audio_to_wav(LONG_MP3_FIXTURE.read_bytes())
+    generated_mp3 = subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+            "sine=frequency=440:sample_rate=16000:duration=210",
+            "-af", "volume='if(lt(mod(t,15),10),1,0)':eval=frame",
+            "-c:a", "libmp3lame", "-b:a", "32k", "-f", "mp3", "pipe:1",
+        ],
+        capture_output=True,
+        check=True,
+        timeout=30,
+    ).stdout
+    normalized = normalize_audio_to_wav(generated_mp3)
     result = split_audio(
         normalized.audio,
         split_strategy="auto",
@@ -260,7 +269,7 @@ def test_long_mp3_fixture_is_preprocessed_and_energy_split(monkeypatch: pytest.M
     assert result.metadata.format == "wav"
     assert result.metadata.sample_rate == 16_000
     assert result.metadata.channels == 1
-    assert result.metadata.duration_seconds == pytest.approx(3630.0, abs=2.0)
+    assert result.metadata.duration_seconds == pytest.approx(210.0, abs=0.2)
     assert result.strategy == "energy"
     assert result.vad_backend == "energy"
     assert len(result.chunks) > 1

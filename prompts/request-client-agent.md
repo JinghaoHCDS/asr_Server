@@ -1,27 +1,29 @@
 # 请求端 Agent 提示词
 
-你是 Mac mini 本地项目的开发代理。你的任务是把项目接入一台局域网内的 WSL ASR 服务器。
+部署路径和 LAN IP 由用户环境决定；示例 `YOUR_WINDOWS_LAN_IP` 与 `/path/to/` 必须替换。历史 Mac / Arch 验收不代表其他平台已实测。
+
+你是 局域网 Agent 客户端项目的开发代理。你的任务是把项目接入一台局域网内的 WSL ASR 服务器。
 
 ASR 服务地址：
 
 ```text
-http://192.168.31.137:18080
+http://YOUR_WINDOWS_LAN_IP:18080
 ```
 
 重要网络约束：
 
-- Mac 上可能存在 `http_proxy`、`https_proxy`、`all_proxy` 指向 `127.0.0.1:7897`。
+- 客户端可能配置了 `http_proxy`、`https_proxy`、`all_proxy` 等环境代理。
 - 请求局域网 ASR 服务时必须绕过代理。
 - 命令行测试使用 `curl --noproxy '*'`。
-- 代码里设置 `NO_PROXY=192.168.31.137,localhost,127.0.0.1`，或使用等价的单请求绕过代理配置。
+- 代码里设置 `NO_PROXY=YOUR_WINDOWS_LAN_IP,localhost,127.0.0.1`，或使用等价的单请求绕过代理配置。
 
 请完成以下任务：
 
 1. 先做连通性检查：
 
 ```bash
-curl --noproxy '*' -v http://192.168.31.137:18080/health
-curl --noproxy '*' -v http://192.168.31.137:18080/v1/models
+curl --noproxy '*' -v http://YOUR_WINDOWS_LAN_IP:18080/health
+curl --noproxy '*' -v http://YOUR_WINDOWS_LAN_IP:18080/v1/models
 ```
 
 2. 读取 `GET /v1/models` 返回值，不要硬编码模型能力。根据服务端声明选择模型。
@@ -66,16 +68,18 @@ DELETE /v1/jobs/{job_id}
 
 job 规则：
 
-- 创建 job 后应收到 `202`、`job_id` 和 `status_url`。
+- 创建 job 后应收到 `202`、`id` 和 `status_url`。
 - 用 `GET /v1/jobs/{job_id}` 轮询状态，不要用前端假进度代替服务端状态。
 - 队列状态看 `status=queued` 和 `queue_position`。
 - 转录进度看 `progress.phase`、`total_chunks`、`completed_chunks`、`current_chunk` 和 `percent`。
 - 单个模型 chunk 内部没有真实百分比，前端只能显示“正在处理第 N 段”。
-- `completed` 后读取 `result.text`。
+- `completed` 后用 `detail=full` 获取一次完整响应，读取 `result.text`。
 - `failed` 后读取 `error.code/message/details`。
 - 用户取消时调用 `DELETE /v1/jobs/{job_id}`；如果服务端正在推理当前 chunk，取消可能要等当前 chunk 完成后生效。
 
 6. 处理错误码：
+
+- `401 unauthorized`：检查客户端 Token 配置，不得通过去掉认证或无穷重试绕过。
 
 - `409 model_loading`：等待 3 秒后重试，最多 20 次。
 - `409 model_unloading_scheduled`：切换其他可用模型，或提示用户稍后重试。
@@ -98,6 +102,14 @@ job 规则：
 - `/v1/models` 中发现的模型列表。
 - 一个真实音频文件的转写结果，至少包含模型 ID、语言、文本前 200 字。
 - 如果实现 job，给出 job 创建响应、至少一次 transcribing 轮询响应、completed 响应摘要。
-- 如果失败，给出 HTTP 状态码、错误 JSON、是否经过代理、是否能 ping 通 `192.168.31.137`。
+- 如果失败，给出 HTTP 状态码、错误 JSON、是否经过代理、是否能 ping 通 Windows 主机的实际 LAN IP。
 
-不要硬编码 MiMo、MOSS 或任何服务端未在 `/v1/models` 声明的模型。不要修改 ASR 服务端。不要把请求发往公网。不要通过代理访问 `192.168.31.137`。
+不要硬编码 MiMo、MOSS 或任何服务端未在 `/v1/models` 声明的模型。不要修改 ASR 服务端。不要把请求发往公网。不要通过代理访问 Windows 主机的实际 LAN IP。
+
+## 当前 job / 能力与鉴权合约
+
+创建响应的任务标识字段是 `id`，路径中的 `{job_id}` 使用该值。轮询使用 `detail=compact`；completed 后请求一次 `detail=full` 读取 `result.text`。如需已完成 chunk 的文字，也使用 full。任务在内存中保存，重启后丢失，不能承诺服务端断点续算。
+
+使用 `purpose=podcast` 时，REST 必须显式选择已声明的 MOSS 模型；它不会自动从默认 Qwen 切换模型。读取 `diarization.status` 和 `speaker_scope`，保留 partial / mixed / unresolved；4–5 小时整期一致性仍未完成完整实测。
+
+启用 `ASR_API_TOKEN` 时，所有 `/v1/**` 请求提供 Bearer 凭据；客户端 CLI 用 `ASR_TOKEN`，MCP 用 `ASR_MCP_TOKEN`。`.env` 只有部署生成的 systemd unit 会读取，客户端和直接 Python 启动不自动加载。

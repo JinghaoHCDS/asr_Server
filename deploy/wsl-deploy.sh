@@ -4,14 +4,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 
-DEPLOY_DIR="${ASR_DEPLOY_DIR:-/home/fragt/services/asr-server}"
+DEPLOY_DIR="${ASR_DEPLOY_DIR:-${SOURCE_DIR}}"
 HOST="${ASR_HOST:-0.0.0.0}"
 PORT="${ASR_PORT:-18080}"
 ADAPTER="${ASR_ADAPTER:-qwen}"
 QWEN_BATCH_SIZE="${ASR_QWEN_BATCH_SIZE:-1}"
 IDLE_UNLOAD_SECONDS="${ASR_IDLE_UNLOAD_SECONDS:-180}"
-HF_HUB_OFFLINE="${ASR_HF_HUB_OFFLINE:-1}"
-TRANSFORMERS_OFFLINE="${ASR_TRANSFORMERS_OFFLINE:-1}"
+HF_HUB_OFFLINE="${ASR_HF_HUB_OFFLINE:-0}"
+TRANSFORMERS_OFFLINE="${ASR_TRANSFORMERS_OFFLINE:-0}"
 SMOKE_MODEL_REPO="${ASR_SMOKE_MODEL_REPO:-Qwen/Qwen3-ASR-0.6B-hf}"
 SMOKE_AUDIO="${ASR_SMOKE_AUDIO:-test-fixtures/audio/test_short.wav}"
 
@@ -26,6 +26,8 @@ RUN_QWEN_BACKEND_SMOKE="${ASR_RUN_QWEN_BACKEND_SMOKE:-1}"
 ENABLE_SERVICE=1
 START_SERVICE=1
 RUN_HTTP_SMOKE=1
+SERVICE_TMP_FILE=""
+trap '[[ -z "${SERVICE_TMP_FILE}" ]] || rm -f -- "${SERVICE_TMP_FILE}"' EXIT
 
 usage() {
   cat <<'EOF'
@@ -33,20 +35,21 @@ Usage:
   deploy/wsl-deploy.sh [options]
 
 Default behavior:
-  - sync this repo to /home/fragt/services/asr-server
+  - deploy in the current checkout (or copy to --deploy-dir)
   - install Arch packages: uv, rsync, git, ffmpeg, libsndfile
   - create Python 3.12 uv environment
   - run pytest and mypy
-  - install pinned CUDA 12.8 torch plus HF native Qwen runtime dependencies
+  - install pinned CUDA 12.8 torch plus HF native Qwen/MOSS runtime dependencies
   - assert torch is CUDA-enabled
   - run minimal Qwen3-ASR transformers backend smoke
   - install and start the systemd user service on 0.0.0.0:18080
+  - allow first-use model downloads; MOSS/alignment stay disabled until separately validated
   - run live HTTP smoke tests against 127.0.0.1:18080
 
 Options:
-  --deploy-dir DIR              Deployment directory. Default: /home/fragt/services/asr-server
+  --deploy-dir DIR              Copy/deploy into DIR. Default: current checkout
   --host HOST                   Service host. Default: 0.0.0.0
-  --port PORT                   Service port. Default: 18080
+  --port PORT                   Service port. Only 18080 is supported
   --adapter NAME                ASR adapter for the service. Default: qwen
   --idle-unload-seconds SECONDS Unload an idle loaded model after this many seconds. Default: 180
   --mock                        Deploy mock adapter and skip GPU/Qwen checks
@@ -61,6 +64,7 @@ Options:
   --smoke-model REPO            Qwen smoke model repo. Default: Qwen/Qwen3-ASR-0.6B-hf
   --smoke-audio PATH            Qwen smoke audio path. Default: test-fixtures/audio/test_short.wav
   --online-service              Allow the systemd service to contact Hugging Face while loading models
+  --offline-service             Only use model caches; prewarm every required model before choosing this
   --no-enable-service           Do not install or enable systemd user service
   --no-start                    Install service but do not start/restart it
   --skip-http-smoke             Do not run live HTTP smoke tests
@@ -151,6 +155,11 @@ while [[ $# -gt 0 ]]; do
       TRANSFORMERS_OFFLINE=0
       shift
       ;;
+    --offline-service)
+      HF_HUB_OFFLINE=1
+      TRANSFORMERS_OFFLINE=1
+      shift
+      ;;
     --no-enable-service)
       ENABLE_SERVICE=0
       shift
@@ -173,26 +182,32 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-case "${PORT}" in
-  8765)
-    die "port 8765 is a historical test port and must not be used"
-    ;;
-  18080)
-    ;;
-  *)
-    log "warning: official deployment port is 18080; requested port is ${PORT}"
-    ;;
-esac
+[[ "${PORT}" == "18080" ]] || die "the only supported LAN API port is 18080"
+[[ "${ADAPTER}" == "qwen" || "${ADAPTER}" == "mock" ]] || die "adapter must be qwen or mock"
+[[ "${HOST}" == "0.0.0.0" || "${HOST}" == "127.0.0.1" ]] || die "host must be 0.0.0.0 (LAN) or 127.0.0.1 (local only)"
+[[ "${IDLE_UNLOAD_SECONDS}" =~ ^[0-9]+$ ]] || die "idle-unload-seconds must be a non-negative integer"
+[[ "${QWEN_BATCH_SIZE}" =~ ^[1-9][0-9]*$ ]] || die "ASR_QWEN_BATCH_SIZE must be a positive integer"
+[[ "${HF_HUB_OFFLINE}" == "0" || "${HF_HUB_OFFLINE}" == "1" ]] || die "ASR_HF_HUB_OFFLINE must be 0 or 1"
+[[ "${TRANSFORMERS_OFFLINE}" == "0" || "${TRANSFORMERS_OFFLINE}" == "1" ]] || die "ASR_TRANSFORMERS_OFFLINE must be 0 or 1"
+
+# Fail before installing or syncing anything on a client machine.
+if [[ "${ADAPTER}" == "qwen" || "${INSTALL_GPU_DEPS}" == "1" || "${INSTALL_SILERO}" == "1" ]]; then
+  [[ "$(uname -s)" == "Linux" ]] || die "real inference deployment requires Windows WSL2; use --mock for CPU development"
+  kernel_release="$(uname -r)"
+  case "${kernel_release}" in
+    *[Mm]icrosoft*|*[Ww][Ss][Ll]*) ;;
+    *) die "real inference dependencies must be installed inside WSL2" ;;
+  esac
+fi
+
+[[ "${DEPLOY_DIR}" == /* ]] || die "deployment directory must be an absolute Linux path"
+[[ "${DEPLOY_DIR}" != *$'\n'* && "${DEPLOY_DIR}" != *$'\r'* ]] || die "deployment directory must not contain newlines"
 
 case "${DEPLOY_DIR}" in
   /mnt/*)
     die "deployment directory must be inside WSL Linux filesystem, not ${DEPLOY_DIR}"
     ;;
 esac
-
-if [[ -r /proc/version ]] && ! grep -qiE 'microsoft|wsl' /proc/version; then
-  log "warning: this script is intended for WSL Arch Linux"
-fi
 
 install_system_packages() {
   if [[ "${INSTALL_SYSTEM_PACKAGES}" != "1" ]]; then
@@ -205,15 +220,20 @@ install_system_packages() {
     return
   fi
 
-  log "pacman not found; checking required commands"
+  log "automatic system package installation is available for Arch only; checking preinstalled commands"
   command -v uv >/dev/null 2>&1 || die "uv is required"
-  command -v rsync >/dev/null 2>&1 || die "rsync is required when sync is enabled"
   command -v git >/dev/null 2>&1 || die "git is required to install Transformers main"
   command -v ffmpeg >/dev/null 2>&1 || die "ffmpeg is required"
+  command -v ffprobe >/dev/null 2>&1 || die "ffprobe is required"
 }
 
 sync_source_tree() {
   if [[ "${SYNC_SOURCE}" != "1" ]]; then
+    [[ -d "${DEPLOY_DIR}" ]] || die "deployment directory does not exist: ${DEPLOY_DIR}"
+    DEPLOY_DIR="$(cd -- "${DEPLOY_DIR}" && pwd -P)"
+    case "${DEPLOY_DIR}" in
+      /mnt/*) die "deployment directory resolves into a Windows mount: ${DEPLOY_DIR}" ;;
+    esac
     log "skipping source sync"
     return
   fi
@@ -224,11 +244,23 @@ sync_source_tree() {
   local deploy_real
   source_real="$(cd -- "${SOURCE_DIR}" && pwd -P)"
   deploy_real="$(cd -- "${DEPLOY_DIR}" && pwd -P)"
+  DEPLOY_DIR="${deploy_real}"
+
+  case "${DEPLOY_DIR}" in
+    /mnt/*) die "deployment directory resolves into a Windows mount: ${DEPLOY_DIR}" ;;
+  esac
 
   if [[ "${source_real}" == "${deploy_real}" ]]; then
     log "source already in deployment directory"
     return
   fi
+
+  case "${deploy_real}/" in
+    "${source_real}/"*) die "deployment directory cannot be nested inside the source checkout" ;;
+  esac
+  case "${source_real}/" in
+    "${deploy_real}/"*) die "deployment directory cannot be a parent of the source checkout" ;;
+  esac
 
   command -v rsync >/dev/null 2>&1 || die "rsync is required to sync ${SOURCE_DIR} to ${DEPLOY_DIR}"
 
@@ -239,10 +271,19 @@ sync_source_tree() {
     --exclude '.mypy_cache/' \
     --exclude '.pytest_cache/' \
     --exclude '__pycache__/' \
+    --exclude '.ruff_cache/' \
     --exclude 'transcripts/' \
     --exclude 'uploads/' \
     --exclude 'models/' \
+    --exclude 'model_cache/' \
+    --exclude 'hf_cache/' \
     --exclude '.cache/' \
+    --exclude 'logs/' \
+    --exclude 'tmp/' \
+    --exclude '.env' \
+    --include '.env.example' \
+    --exclude '.env.*' \
+    --exclude 'data/' \
     "${SOURCE_DIR}/" "${DEPLOY_DIR}/"
 }
 
@@ -314,11 +355,17 @@ assert torch.version.cuda == "12.8", f"unexpected torch CUDA version: {torch.ver
 assert torch.cuda.is_available(), "torch cannot see CUDA"
 print("device:", torch.cuda.get_device_name(0))
 print("capability:", torch.cuda.get_device_capability(0))
+sample = torch.arange(16, device="cuda")
+assert int((sample * sample).sum().item()) == 1240, "CUDA kernel validation failed"
+torch.cuda.synchronize()
+print("CUDA kernel smoke ok")
 print("torchvision:", torchvision.__version__)
 print("torchaudio:", torchaudio.__version__)
 print("transformers:", transformers.__version__)
 assert hasattr(transformers, "AutoProcessor"), "transformers missing AutoProcessor"
 assert hasattr(transformers, "AutoModelForMultimodalLM"), "transformers missing AutoModelForMultimodalLM"
+assert hasattr(transformers, "AutoModelForCausalLM"), "transformers missing AutoModelForCausalLM"
+assert hasattr(transformers, "AutoModelForTokenClassification"), "transformers missing AutoModelForTokenClassification"
 print("HF native Qwen classes import ok")
 PY
 }
@@ -357,46 +404,34 @@ install_user_service() {
   service_dir="${HOME}/.config/systemd/user"
   service_file="${service_dir}/asr-server.service"
   tmp_file="$(mktemp)"
+  SERVICE_TMP_FILE="${tmp_file}"
 
   mkdir -p "${service_dir}"
 
-  cat >"${tmp_file}" <<EOF
-[Unit]
-Description=WSL ASR Server
-After=network-online.target
-Wants=network-online.target
+  "${DEPLOY_DIR}/.venv/bin/python" - \
+    "${DEPLOY_DIR}/deploy/asr-server.service" "${tmp_file}" \
+    "${DEPLOY_DIR}" "${HOST}" "${PORT}" "${ADAPTER}" "${QWEN_BATCH_SIZE}" \
+    "${IDLE_UNLOAD_SECONDS}" "${HF_HUB_OFFLINE}" "${TRANSFORMERS_OFFLINE}" <<'PY'
+import re
+import sys
+from pathlib import Path
 
-[Service]
-Type=simple
-WorkingDirectory=${DEPLOY_DIR}
-Environment=ASR_HOST=${HOST}
-Environment=ASR_PORT=${PORT}
-Environment=ASR_ADAPTER=${ADAPTER}
-Environment=ASR_QWEN_BATCH_SIZE=${QWEN_BATCH_SIZE}
-Environment=ASR_IDLE_UNLOAD_SECONDS=${IDLE_UNLOAD_SECONDS}
-Environment=ASR_WORKER_STARTUP_TIMEOUT_SECONDS=30
-Environment=ASR_WORKER_LOAD_TIMEOUT_SECONDS=900
-Environment=ASR_WORKER_INFERENCE_TIMEOUT_SECONDS=3600
-Environment=ASR_WORKER_SHUTDOWN_TIMEOUT_SECONDS=10
-Environment=ASR_JOB_SHUTDOWN_GRACE_SECONDS=30
-Environment=ASR_MIN_FREE_DISK_MB=5120
-Environment=ASR_MAX_SPOOL_MB=12288
-Environment=ASR_MAX_WORKSPACE_MB=1280
-Environment=ASR_MAX_WORKSPACE_FILES=8
-Environment=HF_HUB_OFFLINE=${HF_HUB_OFFLINE}
-Environment=TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE}
-ExecStart=${DEPLOY_DIR}/.venv/bin/uvicorn asr_server.main:app --host ${HOST} --port ${PORT}
-Restart=on-failure
-RestartSec=5
-TimeoutStopSec=60
-KillMode=mixed
+template, output, *values = sys.argv[1:]
+names = ("PROJECT_DIR", "HOST", "PORT", "ADAPTER", "QWEN_BATCH_SIZE", "IDLE_UNLOAD_SECONDS", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")
 
-[Install]
-WantedBy=default.target
-EOF
+def escape(value):
+    # systemd expands % specifiers even in quoted paths.
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+
+replacements = dict(zip(names, (escape(value) for value in values), strict=True))
+replacements["UVICORN"] = escape(values[0] + "/.venv/bin/uvicorn").replace("$", "$$")
+text = re.sub(r"@([A-Z_]+)@", lambda match: replacements[match.group(1)], Path(template).read_text())
+Path(output).write_text(text)
+PY
 
   install -m 0644 "${tmp_file}" "${service_file}"
   rm -f "${tmp_file}"
+  SERVICE_TMP_FILE=""
 
   log "installed ${service_file}"
   systemctl --user daemon-reload
@@ -424,16 +459,16 @@ run_http_smoke() {
 
   log "waiting for ${base_url}/health"
   for _ in $(seq 1 120); do
-    if curl --noproxy '*' -fsS "${base_url}/health" >/dev/null 2>&1; then
+    if curl --noproxy '*' --connect-timeout 2 --max-time 5 -fsS "${base_url}/health" >/dev/null 2>&1; then
       break
     fi
     sleep 1
   done
 
-  curl --noproxy '*' -fsS "${base_url}/health" >/dev/null
+  curl --noproxy '*' --connect-timeout 2 --max-time 5 -fsS "${base_url}/health" >/dev/null
 
   log "running live HTTP smoke tests"
-  ASR_BASE_URL="${base_url}" "${DEPLOY_DIR}/.venv/bin/pytest" tests/test_http_smoke.py -q
+  ASR_BASE_URL="${base_url}" ASR_HTTP_SMOKE_AUDIO="${SMOKE_AUDIO}" "${DEPLOY_DIR}/.venv/bin/pytest" tests/test_http_smoke.py -q
 }
 
 install_system_packages
@@ -448,4 +483,5 @@ run_http_smoke
 
 log "deployment complete"
 log "local health: curl --noproxy '*' http://127.0.0.1:${PORT}/health"
-log "LAN health:   curl --noproxy '*' http://192.168.31.137:${PORT}/health"
+log "LAN health:   curl --noproxy '*' http://<WINDOWS_LAN_IP>:${PORT}/health"
+log "optional service settings: ${DEPLOY_DIR}/.env (MOSS/alignment require separate GPU smoke tests)"

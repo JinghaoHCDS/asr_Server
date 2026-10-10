@@ -48,7 +48,7 @@ class BridgeSettings:
         max_file_mb = int(os.getenv("ASR_MCP_MAX_FILE_MB", "512"))
         request_timeout_seconds = float(os.getenv("ASR_MCP_REQUEST_TIMEOUT_SECONDS", "3600"))
         return cls(
-            base_url=os.getenv("ASR_MCP_BASE_URL", "http://192.168.31.137:18080"),
+            base_url=os.getenv("ASR_MCP_BASE_URL", "http://127.0.0.1:18080"),
             allowed_roots=allowed_roots,
             bearer_token=os.getenv("ASR_MCP_TOKEN") or None,
             max_file_mb=max_file_mb,

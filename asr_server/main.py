@@ -19,6 +19,7 @@ from asr_server.adapters.mock import MockAsrAdapter
 from asr_server.adapters.qwen import QwenAsrAdapter
 from asr_server.audio.preprocess import probe_audio_duration_path_async
 from asr_server.audio.workspace import WorkspaceManager
+from asr_server.auth import BearerAuthMiddleware, GatewayApp
 from asr_server.config import Settings, load_settings
 from asr_server.errors import AsrError, asr_error_handler, validation_error_handler
 from asr_server.jobs import JobManager
@@ -104,7 +105,7 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
             await job_manager.shutdown()
             await manager.shutdown()
 
-    app = FastAPI(
+    app = GatewayApp(
         title="WSL ASR Server",
         version=__version__,
         description=docs_description(),
@@ -112,6 +113,8 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
     )
     app.add_exception_handler(AsrError, cast(Any, asr_error_handler))
     app.add_exception_handler(RequestValidationError, cast(Any, validation_error_handler))
+    if app_settings.api_token:
+        app.add_middleware(BearerAuthMiddleware, token=app_settings.api_token)
     app.state.manager = ModelLifecycleManager(
         default_models(
             app_settings.default_model,

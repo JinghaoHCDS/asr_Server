@@ -15,7 +15,9 @@ pytestmark = pytest.mark.skipif(
 
 
 BASE_URL = os.getenv("ASR_BASE_URL", "http://127.0.0.1:18080").rstrip("/")
-FIXTURE_AUDIO = Path("test-fixtures/audio/test_short.wav")
+FIXTURE_AUDIO = Path(os.getenv("ASR_HTTP_SMOKE_AUDIO", "test-fixtures/audio/test_short.wav"))
+TOKEN = os.getenv("ASR_HTTP_SMOKE_TOKEN") or os.getenv("ASR_API_TOKEN")
+AUTH_HEADERS = {"Authorization": f"Bearer {TOKEN}"} if TOKEN else {}
 
 
 def error_code(response: httpx.Response) -> str | None:
@@ -31,7 +33,7 @@ def error_code(response: httpx.Response) -> str | None:
 
 
 def test_live_health_and_models() -> None:
-    with httpx.Client(timeout=10.0, trust_env=False) as client:
+    with httpx.Client(timeout=10.0, trust_env=False, headers=AUTH_HEADERS) as client:
         health = client.get(f"{BASE_URL}/health")
         models = client.get(f"{BASE_URL}/v1/models")
 
@@ -43,7 +45,11 @@ def test_live_health_and_models() -> None:
 
 
 def test_live_transcription_and_timestamp_capability() -> None:
-    with httpx.Client(timeout=httpx.Timeout(connect=5.0, read=1800.0, write=30.0, pool=5.0), trust_env=False) as client:
+    with httpx.Client(
+        timeout=httpx.Timeout(connect=5.0, read=1800.0, write=30.0, pool=5.0),
+        trust_env=False,
+        headers=AUTH_HEADERS,
+    ) as client:
         models_response = client.get(f"{BASE_URL}/v1/models")
         models_response.raise_for_status()
         qwen = next(model for model in models_response.json()["models"] if model["id"] == "qwen3-asr-1.7b")

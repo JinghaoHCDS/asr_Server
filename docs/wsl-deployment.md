@@ -1,430 +1,272 @@
-# WSL Arch Linux 部署说明
+# Windows + NVIDIA + WSL 部署
 
-## 目标
+把 Windows 电脑的 NVIDIA GPU 变成局域网 ASR 服务：WSL 运行模型，Agent 客户端通过 HTTP 上传音频。唯一局域网 API 端口是 **18080**；客户端无需安装模型或 CUDA。
 
-服务端真实部署只在 Windows PC 的 WSL Arch Linux 内进行，部署目录固定为：
+已完成真实 GPU 验收的参考环境是 **WSL2 Arch Linux + RTX 5070 Ti 16 GB**。其他 NVIDIA 显卡需要在自己的机器上重新通过 CUDA 和模型 smoke；Ubuntu 下文提供依赖准备参考，尚未完成该发行版的项目 GPU 验收。
 
-```text
-/home/fragt/services/asr-server
+## 1. 准备 Windows 和 WSL
+
+已有 WSL 的用户，在 Windows PowerShell 查看发行版名称和版本：
+
+```powershell
+wsl --list --verbose
+wsl --version
 ```
 
-服务监听：
+使用 WSL2，Windows 安装支持 WSL CUDA 的 NVIDIA 驱动。WSL 内不要另装 Linux 显卡驱动；这里运行官方 PyTorch CUDA wheels，无需为普通推理安装完整 CUDA Toolkit。[NVIDIA WSL 指南](https://docs.nvidia.com/cuda/wsl-user-guide/index.html)
 
-```text
-0.0.0.0:18080
+常驻服务需要 systemd。确认 `/etc/wsl.conf` 包含以下配置；合并进已有文件，保留其他设置：
+
+```ini
+[boot]
+systemd=true
 ```
 
-Mac 侧访问：
-
-```text
-http://192.168.31.137:18080
-```
-
-不要把项目放在 `/mnt/c`，不要使用历史测试端口 `8765`。
-
-## 基础准备
+修改 WSL 配置后，在没有其他重要 WSL 任务运行时，从 PowerShell 执行 `wsl --shutdown`，再进入目标发行版。运行：
 
 ```bash
-cd /home/fragt/services/asr-server
-uv sync
-uv run pytest -q
-uv run mypy asr_server asr_mcp tests scripts
+systemctl --user show-environment >/dev/null
+nvidia-smi
 ```
 
-## 一键部署
+第一条失败时先解决 systemd user manager，第二条失败时先解决 Windows 驱动和 WSL GPU 可见性。[微软 systemd 指南](https://learn.microsoft.com/en-us/windows/wsl/systemd)
 
-在 WSL Arch Linux 内，从项目 checkout 目录运行：
+## 2. 在 Linux HOME 里克隆
+
+安装到 WSL 原生文件系统，例如 `$HOME/services/asr-server`。部署脚本默认直接使用当前 checkout，支持不同用户名和目录，不向某个固定用户目录复制。
+
+Arch Linux：
 
 ```bash
-deploy/wsl-deploy.sh
+sudo pacman -Syu --needed git uv rsync ffmpeg libsndfile
+mkdir -p "$HOME/services"
+git clone https://github.com/JinghaoHCDS/asr_Server.git "$HOME/services/asr-server"
+cd "$HOME/services/asr-server"
 ```
 
-默认行为：
-
-- 同步当前项目到 `/home/fragt/services/asr-server`。
-- 安装 Arch 系统包 `uv`、`rsync`、`git`、`ffmpeg`、`libsndfile`。
-- 创建 Python 3.12 uv 环境并执行 `uv sync --frozen`。
-- 运行 `pytest` 和 `mypy`。
-- 安装 `requirements/wsl-gpu-cu128.txt` 中固定的 CUDA 12.8 torch、HF native Qwen 运行时依赖和 MOSS 可选运行时依赖。
-- 校验 `torch==2.11.0+cu128`、CUDA 可用和 Transformers HF native Qwen/MOSS loading 类可导入。
-- 跑一次 `Qwen/Qwen3-ASR-0.6B-hf` + `test-fixtures/audio/test_short.wav` 的 `transformers` 后端 smoke。
-- 安装并启动 `systemd --user` 服务 `asr-server.service`。
-- 常驻服务通过 `/home/fragt/services/asr-server/.venv/bin/uvicorn` 直接启动，避免 `uv run` 在 systemd 或 Windows 任务计划程序启动时联网同步依赖，导致服务没有监听 `18080`。
-- 常驻服务默认设置 `ASR_IDLE_UNLOAD_SECONDS=180`，转录完成后 3 分钟无新增同模型请求就自动卸载模型并释放 CUDA cache。
-- 常驻服务默认设置 `HF_HUB_OFFLINE=1` 和 `TRANSFORMERS_OFFLINE=1`，使用部署 smoke 已拉取并验收过的本地模型缓存，避免运行时被 Hugging Face HEAD 请求超时拖住。
-- MOSS 默认不进入 `/v1/models`；只有单独跑通 MOSS smoke 并设置 `ASR_ENABLE_MOSS=1` 后才注册 `moss-transcribe-diarize-0.9b`。
-- 对 `http://127.0.0.1:18080` 运行 HTTP smoke test。
-
-如果需要让常驻服务启动后仍可在线拉取 Hugging Face 模型文件：
+Ubuntu 依赖准备参考（尚未 GPU 实测）：
 
 ```bash
-deploy/wsl-deploy.sh --online-service
+sudo apt-get update
+sudo apt-get install -y git rsync ffmpeg libsndfile1 build-essential
+# 如尚未安装 uv，使用官方安装器后重新打开终端
+curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-如果只想更新代码并重启服务，不重装 GPU 依赖和不重新下载模型：
+Ubuntu 再执行同样的 `mkdir`、`git clone` 和 `cd`。后续部署命令使用 `--skip-system-packages`，避免让脚本尝试处理发行版系统包。[uv 官方安装文档](https://docs.astral.sh/uv/getting-started/installation/)
+
+## 3. 首次部署 Qwen
+
+准备一小段自己有权使用的语音，例如 `$HOME/audio/smoke.wav`，包含清晰讲话；仓库也保留了用于既有验收的短音频 `test-fixtures/audio/test_short.wav`。首次部署会下载运行时依赖和模型，需联网并留出充足磁盘空间。
 
 ```bash
-deploy/wsl-deploy.sh \
+bash deploy/wsl-deploy.sh \
   --skip-system-packages \
-  --skip-gpu-deps \
-  --skip-cuda-check \
-  --skip-qwen-backend-smoke
+  --smoke-audio "$HOME/audio/smoke.wav"
 ```
 
-如果只是验证部署流程，不启用真实 Qwen/GPU：
+脚本依次完成：
+
+1. 确认真实部署运行在 WSL，使用 Linux 原生目录和 `18080`。
+2. 安装 Python 3.12，执行 `uv sync --frozen`，跑 mock 单元测试与 mypy。
+3. 从 PyTorch 官方 **cu128** 源安装 `requirements/wsl-gpu-cu128.txt`；检查 `nvidia-smi`、CUDA torch 和 HF native Transformers 类。
+4. 用 `Qwen/Qwen3-ASR-0.6B-hf` 跑独立后端 smoke，要求非空文本。
+5. 从 `deploy/asr-server.service` 模板生成当前用户的 unit，启动 API；HTTP smoke 再用同一段音频验证默认 `qwen3-asr-1.7b`。
+
+MOSS 和 Qwen 强制对齐默认关闭；首次部署只验收 Qwen 转录。部署模板不要直接 `cp` 到 systemd 目录，它含有需要渲染的路径占位符。
+
+确认启动：
 
 ```bash
-deploy/wsl-deploy.sh --mock
+curl --noproxy '*' -fsS http://127.0.0.1:18080/health
+curl --noproxy '*' -fsS http://127.0.0.1:18080/v1/models
 ```
 
-## GPU 运行时依赖
+常驻服务直接运行当前 `.venv/bin/uvicorn`，避免每次开机通过 `uv run` 同步依赖。默认允许首次加载时从 Hugging Face 下载，解决只预热 0.6B 却调用默认 1.7B 的缓存缺失问题；模型在最后一次转录完成后空闲 180 秒自动卸载。
 
-WSL 侧真实运行时统一使用这组 PyTorch CUDA、HF native Qwen 和可选 MOSS 依赖：
-
-```text
-torch==2.11.0+cu128
-torchvision==0.26.0+cu128
-torchaudio==2.11.0+cu128
-transformers
-accelerate
-safetensors
-soundfile
-librosa
-av
-soxr
-numba==0.65.1
-llvmlite==0.47.0
-moss-transcribe-diarize
-```
-
-安装命令：
+只想准备环境和验收模型、暂不安装常驻服务：
 
 ```bash
-uv pip install --torch-backend cu128 -r requirements/wsl-gpu-cu128.txt
+bash deploy/wsl-deploy.sh --skip-system-packages \
+  --smoke-audio "$HOME/audio/smoke.wav" --no-enable-service
+ASR_ADAPTER=qwen .venv/bin/uvicorn asr_server.main:app --host 0.0.0.0 --port 18080
 ```
 
-不要裸跑 `pip install torch`，也不要让模型相关依赖把 torch 替换成 CPU wheel。安装后必须验收：
+## 4. 启用 MOSS 播客转录
+
+运行时依赖已随部署安装，但 MOSS 模型只有在本机独立 smoke 通过后才可以进入 `/v1/models`：
 
 ```bash
-uv run python - <<'PY'
+.venv/bin/python scripts/moss_backend_smoke.py \
+  --model OpenMOSS-Team/MOSS-Transcribe-Diarize \
+  --audio "$HOME/audio/smoke.wav" \
+  --language auto
+```
+
+确认输出非空文本和可解析 segments，再检查 CUDA 没被依赖替换：
+
+```bash
+.venv/bin/python - <<'PY'
 import torch
-import torchvision
-import torchaudio
-import transformers
-
-print("torch:", torch.__version__)
-print("torch cuda:", torch.version.cuda)
-print("cuda available:", torch.cuda.is_available())
-assert torch.__version__ == "2.11.0+cu128"
-assert torch.version.cuda == "12.8"
+print(torch.__version__, torch.version.cuda, torch.cuda.get_device_name(0))
+assert torch.version.cuda is not None
 assert torch.cuda.is_available()
-print("device:", torch.cuda.get_device_name(0))
-print("capability:", torch.cuda.get_device_capability(0))
-print("torchvision:", torchvision.__version__)
-print("torchaudio:", torchaudio.__version__)
-print("transformers:", transformers.__version__)
-assert hasattr(transformers, "AutoProcessor")
-assert hasattr(transformers, "AutoModelForMultimodalLM")
-assert hasattr(transformers, "AutoModelForCausalLM")
-assert hasattr(transformers, "AutoModelForTokenClassification")
-print("HF native Qwen and MOSS loading classes import ok")
 PY
 ```
 
-本轮 Transformers 固定到 `ea31b0c6ab0d1368130b0482aee7293a014c3a38`，因为该官方 revision 的 `apply_transcription_request(..., prompt=...)` 才让 Qwen Context 真正进入输入。安装任何 MOSS/对齐依赖后都要重复上面的 CUDA 验收，禁止让解析器换成 CPU torch。
-
-### 可选 Qwen 强制对齐
-
-先在在线环境拉取并验收 ASR 与官方对齐器：
+修改 checkout 中的 `.env`，设置 `ASR_ENABLE_MOSS=1`；这个文件被 systemd 加载，且不提交 Git。如文件不存在可从 `.env.example` 复制，保留已有配置。然后：
 
 ```bash
-uv run python scripts/qwen_forced_alignment_smoke.py \
-  --audio test-fixtures/audio/test_short.wav \
-  --asr-model Qwen/Qwen3-ASR-0.6B-hf \
-  --language auto
-```
-
-再做带 Context 的真实转录和“音频不存在该词”的反例；反例可用：
-
-```bash
-uv run python scripts/qwen_asr_backend_smoke.py \
-  --backend transformers \
-  --audio test-fixtures/audio/test_short.wav \
-  --prompt 'Reference vocabulary only; do not invent: ABSENTTERMZXQ' \
-  --reject-hallucinated-term ABSENTTERMZXQ
-```
-
-只有两项通过后才用 systemd drop-in 设置 `Environment=ASR_ENABLE_QWEN_ALIGNMENT=1`。对齐器按首次口播请求懒加载；普通转录和播客不承担这部分显存。生产服务处于 offline 模式前必须先完成模型缓存预热。
-
-交互式调试真实 Qwen adapter 时可以使用：
-
-```bash
-ASR_ADAPTER=qwen uv run uvicorn asr_server.main:app --host 0.0.0.0 --port 18080
-```
-
-常驻服务和 Windows 启动任务不要使用 `uv run uvicorn` 作为启动命令。`uv run` 可能在启动时尝试同步依赖并访问 PyPI 镜像；如果网络超时，systemd 会显示 service 已启动过但 API 端口没有监听。部署脚本和 service 模板统一使用已创建好的虚拟环境入口：
-
-```bash
-ASR_ADAPTER=qwen \
-ASR_QWEN_BATCH_SIZE=1 \
-ASR_IDLE_UNLOAD_SECONDS=180 \
-HF_HUB_OFFLINE=1 \
-TRANSFORMERS_OFFLINE=1 \
-/home/fragt/services/asr-server/.venv/bin/uvicorn asr_server.main:app --host 0.0.0.0 --port 18080
-```
-
-## 可选 MOSS 说话人分离
-
-`moss-transcribe-diarize-0.9b` 是可选模型。依赖可以随 `requirements/wsl-gpu-cu128.txt` 安装，但模型默认不注册，避免在未验收环境里让客户端看到不可用能力。
-
-启用前先在 WSL 侧跑独立 smoke：
-
-```bash
-uv run python scripts/moss_backend_smoke.py \
-  --model OpenMOSS-Team/MOSS-Transcribe-Diarize \
-  --audio test-fixtures/audio/test_short.wav \
-  --language auto
-```
-
-smoke 必须返回非空文本和可解析 `segments`，并确认安装 MOSS 依赖后 `torch.version.cuda is not None` 且 `torch.cuda.is_available()` 仍为 `True`。
-
-部署脚本在 `uv sync` 完成后使用部署目录里的 `.venv/bin/python`、`.venv/bin/pytest` 和 `.venv/bin/mypy` 直接执行检查，避免长任务被额外的 `uv run` 环境锁阻塞。不要并行运行多个会修改同一 `.venv` 的 uv 命令。
-
-交互式启动 MOSS gate：
-
-```bash
-ASR_ADAPTER=qwen ASR_ENABLE_MOSS=1 \
-uv run uvicorn asr_server.main:app --host 0.0.0.0 --port 18080
-```
-
-常驻 systemd 服务启用 MOSS 时，使用 drop-in，不要直接手改部署脚本生成的 unit：
-
-```bash
-mkdir -p ~/.config/systemd/user/asr-server.service.d
-cat > ~/.config/systemd/user/asr-server.service.d/10-enable-moss.conf <<'EOF'
-[Service]
-Environment=ASR_ENABLE_MOSS=1
-EOF
-systemctl --user daemon-reload
 systemctl --user restart asr-server.service
+curl --noproxy '*' -fsS http://127.0.0.1:18080/v1/models
 ```
 
-启用后验证模型发现和一次转录：
+用短音频确认服务接口返回 segments：
 
 ```bash
-curl --noproxy '*' -sS http://127.0.0.1:18080/v1/models
-curl --noproxy '*' -sS \
-  -F file=@test-fixtures/audio/test_short.wav \
+curl --noproxy '*' -fsS \
+  -F "file=@$HOME/audio/smoke.wav" \
   -F model=moss-transcribe-diarize-0.9b \
   -F response_format=verbose_json \
   http://127.0.0.1:18080/v1/audio/transcriptions
 ```
 
-MOSS 当前只声明 `transformers` 后端和 `language=auto`。2026-07-10 使用固定 snapshot 的对抗性 smoke 中，`language=en` 对中文输入仍输出中文，因此不得声明 `zh/en` 已可靠生效。`verbose_json` 会返回 `segments[].speaker`、`segments[].start` 和 `segments[].end`；这不是 PRD 里的 `word`/`char` timestamps，也不是 forced alignment。
+长播客使用 `POST /v1/audio/transcription-jobs`，读取创建响应的 `id` 作为 `GET /v1/jobs/{id}?detail=compact` 的路径参数；完成后用 `detail=full` 取一次最终 `result.text`。
 
-2026-07-15 的 RTX 5070 Ti 实测把 MOSS `auto` 策略收敛为：不超过 1801 秒时原生单次推理并返回 `speaker_scope=global`；更长音频自动降级为 1800 秒 fixed chunks，并返回 `moss_native_long_form_fallback:duration_exceeds_validated_native_limit`。分块 speaker 使用 `chunk-NNNN:S01` 命名空间，返回 `speaker_label`、`speaker_scope=chunk` 和 `chunk_index`，同时带有 `moss_speaker_labels_are_chunk_local`。显式 `split_strategy=none` 可以发起未验证的更长原生挑战，但 60/90 分钟实测均在约 3044 秒停止产出，服务会以 `422 incomplete_transcript` 拒绝残缺结果。
+MOSS 只声明 `transformers` 后端和可靠的 `language=auto`。`segments` 包含段级时间与匿名 speaker，不代表逐字时间戳。普通 `purpose=transcription` 且 `speaker_resolution=off` 时，`auto` 在不超过 1801 秒的已验收窗口内使用原生长音频；更长输入退回 1800 秒分块，speaker 身份只保证块内一致。
 
-需要跨块匿名说话人 ID 时，可显式增加 `speaker_resolution=auto`。服务会把已确认说话人的短参考片段前置到后续正文块，在同一次 MOSS 推理内解析标签；`required` 模式会拒绝任何部分解析结果。该能力默认关闭，正文窗口会从 1800 秒收缩到 1200 秒，并为最多 60 秒锚点前缀和高语速内容的输出密度留出余量。调用方未显式传 `max_new_tokens` 时，Anchor Replay 使用至少 24000 的自动生成预算；显式值保持原样，硬上限仍为 65536。1740 秒正文曾在真实四人密集播客上只覆盖到约 1324 秒，并被尾部保护正确拒绝；1200 秒正文加 60 秒锚点按旧动态公式得到的 15120 也曾在第 3 块触顶。全局身份还要求至少一段连续 2 秒的稳定语音，片头音效或极短插话只作为待确认片段，不进入锚点。2026-07-15 在 RTX 5070 Ti 上使用 4 位真实不同声音、2 个重复块完成验收：4 个本地标签均稳定回连，0 冲突、0 未解析，时间轴覆盖 99.91%。返回的 `speaker-NNNN` 仅在本次任务内有效，不代表姓名或跨任务生物身份。
+传入 `purpose=podcast` 会选择播客参数，并默认启用 `speaker_resolution=auto` 的 Anchor Replay；也可显式传 `speaker_resolution=required`，要求无法完整解析时返回错误。Anchor Replay 使用 1200 秒正文窗口和最多 60 秒参考前缀，未显式指定时自动生成预算至少 24000；ID 只对当前 job 有效。只有响应 `speaker_scope=global` 才把标签视为整期一致，`mixed` / unresolved 片段应保留未知状态。
 
-## 可选 Silero VAD
+截断或缺尾会受控报错，不能把完成百分比当成转录准确率。71 分钟四人样本产生了完整正文，但片头短句 unresolved，结果为 `partial/mixed`；4–5 小时整期 speaker 一致性仍未完成实测。自动预算下限修改也不能沿用旧样本成功结果作为新预算验收。能力及当前限制以 `/v1/models` 为准；验证证据见 [最新升级记录](validation-2026-09-19-upgrade.md)、[71 分钟真实播客记录](validation-2026-07-15-live-chunks-four-speaker-podcast.md)、[MOSS 长音频记录](validation-2026-07-15-wsl-moss-long-form.md) 和 [Anchor Replay 记录](validation-2026-07-15-wsl-moss-anchor-replay.md)。
 
-生产 Path 管线的长音频 `split_strategy=auto` 当前使用有界内存的 streaming energy VAD，再失败时使用 fixed window。旧 Silero 实现会把整段音频展开为 Python float list，六小时音频理论峰值超过 13 GiB，因此 Path 模式会返回 `silero_streaming_not_validated_fallback_to_energy` warning。只有新的 bounded streaming Silero 实现通过 RSS 与边界正确性验收后，才能恢复优先 Silero。Mac/mock 环境不需要安装 Silero、CUDA torch 或模型缓存。
+## 5. 局域网连通
 
-Silero 依赖只在 WSL 真实环境中安装，并且应在 CUDA 版 torch 验收通过后安装：
+推荐使用 Windows 11 22H2 或更高版本的 WSL mirrored networking。在 Windows 的 `%UserProfile%\.wslconfig` 中合并：
+
+```ini
+[wsl2]
+networkingMode=mirrored
+```
+
+重启 WSL 配置后，在管理员 PowerShell 中添加专用网络入站规则，只开放 `18080`：
+
+```powershell
+New-NetFirewallRule -DisplayName "ASR Server LAN" `
+  -Direction Inbound -Action Allow -Protocol TCP -LocalPort 18080 `
+  -Profile Private -RemoteAddress LocalSubnet
+```
+
+如果 WSL Hyper-V 防火墙仍阻拦该端口，可按微软说明添加针对 WSL 的单端口规则：
+
+```powershell
+New-NetFirewallHyperVRule -Name "ASRServer18080" -DisplayName "ASR Server WSL" `
+  -Direction Inbound -VMCreatorId '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}' `
+  -Protocol TCP -LocalPorts 18080
+```
+
+找出 Windows 当前的局域网 IPv4 地址（PowerShell `ipconfig`），从另一台同网设备访问：
 
 ```bash
-uv pip install silero-vad==6.2.1
+# 替换为 Windows 主机的 LAN IP
+ASR_BASE_URL=http://192.168.1.100:18080
+curl --noproxy '*' -fsS "$ASR_BASE_URL/health"
+curl --noproxy '*' -fsS "$ASR_BASE_URL/v1/models"
 ```
 
-`silero_vad` 仍保留为后续 bounded streaming 验收依赖，不在基础 import 或普通 mock 测试阶段加载；响应中的 `split.vad_backend` 和 `split.warnings` 会记录实际使用的 VAD 后端与 fallback 原因。
+示例 IP 需要替换，建议给 Windows 主机设置路由器 DHCP 地址保留。localhost 成功只证明本机服务正常，第二台设备的请求才能证明 LAN 可达。Windows 默认 NAT 环境没有本项目的 LAN 验收；本指南采用 mirrored，不添加端口代理或公网映射。[微软 WSL 网络文档](https://learn.microsoft.com/en-us/windows/wsl/networking)
 
-## 转录调优参数
+## 6. 可选鉴权与离线模型缓存
 
-同步转录接口和异步 job 接口支持以下调优字段：
+systemd 读取 checkout 下可选的 `.env`。支持的服务设置包括：
 
-- `purpose`：`transcription`、`oral_analysis`、`podcast`；用途配置提供能力默认值，不绕过 `/v1/models` 校验。
-- `context`：正文规范化后最多使用 3000 字符，总 prompt 最多 4000 字符；截断在 `context.truncated` 和 warnings 中可见。
-- `hotwords`：逗号分隔或 JSON 字符串数组，大小写去重，最多 100 个；Qwen 通过官方 system prompt、MOSS 通过 transcription prompt 实际使用，`context.applied/method` 可审计。
-- `max_new_tokens`：可选生成长度上限。Qwen 默认 512、上限 4096；MOSS 默认按单次模型输入时长计算 `max(2048, ceil(seconds * 12))`、上限 65536；多 chunk Anchor Replay 未显式指定时使用至少 24000。达到上限返回 `422 generation_truncated`，不会静默返回残缺正文。
-- `split_strategy`：`auto`、`none`、`fixed`、`silero`、`energy`、`vad`。Qwen `auto` 使用通用有界切分；MOSS `auto` 使用上述原生/1800 秒自动降级策略。
-- `speaker_resolution`：`off`（默认）、`auto`、`required`。只对 MOSS 开放；客户端应先读取 `/v1/models` 的 `speaker_resolution_modes`。
-
-Qwen 长音频默认按 WSL 实测后的稳定组合执行：
-
-```text
-max_chunk_seconds=120
-max_new_tokens=512
-ASR_QWEN_BATCH_SIZE=1
-```
-
-MOSS 响应的稳定诊断字段为：`execution.mode`、`execution.speaker_scope`、`generation.prompt_tokens`、`generation.generated_tokens`、`generation.max_new_tokens`、`generation.peak_vram_allocated_mb`、`generation.segment_coverage_ratio`、`audible_speech_end_seconds` 和 `uncovered_speech_intervals`。覆盖检查用能量活动区间发现疑似中段空洞并忽略正常尾部静音；能量活动不是可靠的语音分类，覆盖率也不是转录准确率或 speaker 正确率。
-
-Qwen chunk batch size 通过环境变量配置，默认保守为 `1`：
-
-```bash
-ASR_QWEN_BATCH_SIZE=2 ASR_ADAPTER=qwen uv run uvicorn asr_server.main:app --host 0.0.0.0 --port 18080
-```
-
-只有 batch size 在 `qwen3-asr-0.6b` 和 `qwen3-asr-1.7b` 上都稳定后，才把更大的值写入常驻服务配置。
-
-## 服务端限制参数
-
-以下限制通过环境变量控制：
-
-```text
+```dotenv
+ASR_ENABLE_MOSS=0
+ASR_ENABLE_QWEN_ALIGNMENT=0
+ASR_IDLE_UNLOAD_SECONDS=180
 ASR_MAX_UPLOAD_MB=512
 ASR_MAX_QUEUED_JOBS=20
 ASR_JOB_RESULT_TTL_SECONDS=3600
-ASR_IDLE_UNLOAD_SECONDS=180
 ```
 
-- `ASR_MAX_UPLOAD_MB`：单次上传音频大小上限；同步转录和异步 job 创建都会执行，超限返回 `413 audio_too_large`。
-- 单文件音频时长硬上限为 6 小时；超过返回 `422 duration_limit_exceeded`。
-- `ASR_MAX_QUEUED_JOBS`：queued/running job 总数上限；超限返回 `429 job_queue_full`。
-- `ASR_JOB_RESULT_TTL_SECONDS`：job 完成、失败或取消后结果保留时间；过期后客户端应重新提交。
-- `ASR_IDLE_UNLOAD_SECONDS`：模型最后一次转录结束后等待多少秒自动卸载；默认 `180`，设为 `0` 可关闭自动空闲卸载。
+修改后重启 unit。需要 Bearer Token 时设置 `ASR_API_TOKEN`，并用 `chmod 600 .env` 限制文件权限；`/v1/**` 请求增加 `Authorization: Bearer <token>`，健康检查保持公开。
 
-## 异步 job 与进度查询
+HTTP smoke 从进程环境读取 `ASR_HTTP_SMOKE_TOKEN`（也接受 `ASR_API_TOKEN`），不自动加载 `.env`。对已开启鉴权的部署重跑检查时，需在当前终端注入与服务端一致的 token。`scripts/asr_client.py` 使用客户端环境变量 `ASR_TOKEN`，MCP bridge 使用 `ASR_MCP_TOKEN`；不要把真实 token 写进提交或命令示例。
 
-长音频或需要前端展示进度时，优先使用异步 job：
+离线服务是可选模式。先在线 smoke 预热 **每个要使用的模型**（Qwen 两个尺寸、已启用的 MOSS，以及可选对齐器），再在 `.env` 中增加：
 
-```text
-POST /v1/audio/transcription-jobs
-GET /v1/jobs/{job_id}?detail=compact
-DELETE /v1/jobs/{job_id}
+```dotenv
+HF_HUB_OFFLINE=1
+TRANSFORMERS_OFFLINE=1
 ```
 
-设计边界：
+也可在部署时传 `--offline-service`；该选项本身不会预下载所有模型。Qwen 默认使用 native `AutoProcessor` + `AutoModelForMultimodalLM`，不依赖默认 `qwen-asr` 包加载路径，不声明 vLLM。
 
-- 服务端使用内存 JobManager 和单 worker FIFO 队列。
-- 可以提交多个 job，但同一时间只运行一个真实模型转录；后续 job 显示 `queued` 和 `queue_position`。
-- 默认 `detail=compact` 只返回阶段和 chunk 计数，不反复返回累计全文。任务结束后使用一次 `detail=full` 获取结果。
-- 进度是服务端阶段和 chunk 级真实进度，包括 `total_chunks`、`completed_chunks`、`current_chunk`。
-- 不承诺单个模型 chunk 内部 token/帧级百分比。
-- 进程重启后内存 job 可以丢失；客户端应重新提交。
-- job 完成、失败或取消后清理上传音频和中间临时文件；TTL 只保留内存中的 job 状态和结果，不保留音频文件。
-- job 结果默认保留 1 小时，可用 `ASR_JOB_RESULT_TTL_SECONDS` 调整。
-
-示例：
+Qwen 强制对齐必须先独立完成 GPU smoke 和 Context/反幻觉验收，然后才能设置 `ASR_ENABLE_QWEN_ALIGNMENT=1`：
 
 ```bash
-curl --noproxy '*' -sS \
-  -F file=@test-fixtures/audio/test_long.mp3 \
-  -F model=qwen3-asr-1.7b \
-  -F backend=auto \
-  -F language=auto \
-  http://127.0.0.1:18080/v1/audio/transcription-jobs
+.venv/bin/python scripts/qwen_forced_alignment_smoke.py \
+  --audio "$HOME/audio/smoke.wav" --asr-model Qwen/Qwen3-ASR-0.6B-hf --language auto
+.venv/bin/python scripts/qwen_asr_backend_smoke.py \
+  --backend transformers --audio "$HOME/audio/smoke.wav" \
+  --prompt 'Reference vocabulary only; do not invent: ABSENTTERMZXQ' \
+  --reject-hallucinated-term ABSENTTERMZXQ
 ```
 
-返回 `job_id` 后轮询：
+## 7. 日常启动、停止和更新
+
+在 WSL checkout 中：
 
 ```bash
-curl --noproxy '*' -sS 'http://127.0.0.1:18080/v1/jobs/<job_id>?detail=compact'
-
-# 完成后仅取一次全文
-curl --noproxy '*' -sS 'http://127.0.0.1:18080/v1/jobs/<job_id>?detail=full'
-```
-
-Mac 侧局域网验收同样使用 `http://192.168.31.137:18080`，并且必须绕过本机代理。
-
-当前 WSL 实测记录见：
-
-```text
-docs/validation-2026-07-02-wsl-hf-native.md
-docs/validation-2026-07-10-wsl-moss.md
-```
-
-## 后端预验收
-
-开发或启用真实 Qwen adapter 前，先跑：
-
-```bash
-uv run python scripts/qwen_asr_backend_smoke.py --backend transformers --model Qwen/Qwen3-ASR-0.6B-hf --audio test-fixtures/audio/test_short.wav
-```
-
-默认 `transformers` smoke 走 HF native `AutoProcessor` + `AutoModelForMultimodalLM`。返回非空文本后，再接入或启用服务端真实 Qwen adapter。当前不在 `/v1/models` 中声明 `vllm`。
-
-启用 MOSS 前还必须跑：
-
-```bash
-uv run python scripts/moss_backend_smoke.py --model OpenMOSS-Team/MOSS-Transcribe-Diarize --audio test-fixtures/audio/test_short.wav
-```
-
-## HTTP smoke test
-
-服务已启动后运行：
-
-```bash
-ASR_BASE_URL=http://127.0.0.1:18080 uv run pytest tests/test_http_smoke.py -q
-```
-
-或者一键启动 mock/qwen 服务并跑 HTTP smoke：
-
-```bash
-ASR_ADAPTER=qwen scripts/wsl_smoke.sh
-```
-
-## 一键启动与停止
-
-正式部署完成后，日常启动和停止统一操作 `systemd --user` 服务，不直接手写 `uvicorn` 命令：
-
-```bash
-scripts/start_asr_server.sh
-scripts/shutdown_asr_server.sh
-```
-
-`scripts/start_asr_server.sh` 会：
-
-- 检查 `asr-server.service` 是否已安装。
-- 启动已部署的 `/home/fragt/services/asr-server/.venv/bin/uvicorn` 服务。
-- 等待 `http://127.0.0.1:18080/health` 返回成功。
-- 打印本机和局域网访问地址。
-
-`scripts/shutdown_asr_server.sh` 会：
-
-- 停止 `asr-server.service`。
-- 等待服务进入 inactive。
-- 确认 `http://127.0.0.1:18080/health` 不再响应。
-
-可用环境变量覆盖默认值：
-
-```bash
-ASR_SERVICE_NAME=asr-server.service
-ASR_PORT=18080
-ASR_BASE_URL=http://127.0.0.1:18080
-ASR_START_WAIT_SECONDS=90
-ASR_SHUTDOWN_WAIT_SECONDS=90
-```
-
-如果还要在同一个脚本里跑 Qwen `transformers` 后端预验收：
-
-```bash
-ASR_ADAPTER=qwen ASR_RUN_QWEN_BACKEND_SMOKE=1 scripts/wsl_smoke.sh
-```
-
-如果要让该 smoke 脚本启动的服务暴露 MOSS，可额外设置 `ASR_ENABLE_MOSS=1`。这只影响服务注册，不替代独立的 `scripts/moss_backend_smoke.py`。
-
-## systemd user service
-
-```bash
-mkdir -p ~/.config/systemd/user
-cp deploy/asr-server.service ~/.config/systemd/user/asr-server.service
-systemctl --user daemon-reload
-systemctl --user enable --now asr-server.service
-systemctl --user status asr-server.service
-```
-
-`deploy/asr-server.service` 的 `ExecStart` 必须指向部署目录里的 `.venv/bin/uvicorn`，不要改回 `uv run uvicorn`。服务重启后用下面两个命令同时确认 systemd 状态和端口健康：
-
-```bash
+bash scripts/start_asr_server.sh
+bash scripts/shutdown_asr_server.sh
 systemctl --user status asr-server.service --no-pager
-curl --noproxy '*' http://127.0.0.1:18080/health
+journalctl --user -u asr-server.service -n 80 --no-pager
 ```
 
-## Windows 启动任务
+启动脚本确认 unit 和 health；停止脚本确认 unit inactive 和 health 不再响应。模型卸载、job 取消和服务停止遵循已有生命周期约束。服务重启会丢失内存 job，更新前等正在执行的任务结束。
 
-`deploy/windows-start-asr.ps1` 可作为 Windows 任务计划程序调用脚本。任务应在用户登录后运行，并确保 WSL 发行版名称与脚本中的 `$Distro` 一致。
+更新源码后保留已经安装的 GPU 包，并重新做 CUDA 和模型验收：
 
-## 防火墙
+```bash
+git pull --ff-only
+bash deploy/wsl-deploy.sh --skip-system-packages --skip-gpu-deps \
+  --smoke-audio "$HOME/audio/smoke.wav"
+```
 
-Windows 只需要为专用网络开放 TCP `18080`。不要开放 `8001`、`8765` 或公网入口。
+`--skip-gpu-deps` 使用 `uv sync --frozen --inexact`，避免清掉已安装的推理包；如果 requirements 改变，应重新执行完整部署。不要并行修改同一个 `.venv`。指定另一处部署目录可用 `--deploy-dir "$HOME/services/asr-production"`；复制排除虚拟环境、缓存、音频运行数据和 `.env`，不会删除目标已有文件。
+
+开发机仅验收 mock 部署流程可用 `--mock`；这不证明真实 CUDA 或模型可用。
+
+## 8. Windows 登录后自动启动
+
+先在 WSL 完成正常部署，并允许用户 manager 在登录会话外运行：
+
+```bash
+sudo loginctl enable-linger "$USER"
+```
+
+将 `deploy/windows-start-asr.ps1` 复制到 Windows 的固定位置，例如 `C:\tools\asr\windows-start-asr.ps1`。任务计划程序创建**当前 Windows 用户登录时**任务，程序为 `powershell.exe`，参数例如：
+
+```text
+-NoProfile -ExecutionPolicy Bypass -File "C:\tools\asr\windows-start-asr.ps1" -Distro "archlinux" -LinuxUser "your-linux-user" -ProjectDir "/home/your-linux-user/services/asr-server"
+```
+
+发行版名称来自 `wsl --list --verbose`；用户名和路径来自自己的 WSL。省略 `-Distro` 使用默认发行版，省略 `-LinuxUser` 使用该发行版默认用户，省略 `-ProjectDir` 使用该用户的 `$HOME/services/asr-server`。
+
+任务应允许长期运行、关闭自动运行时长上限，并设置已有实例运行时不启动新实例；可为失败配置一分钟后重试。Windows 脚本启动已经安装的 systemd unit，保留一个 WSL 前台等待进程，直到 unit 停止。仅启用 systemd 不能保证 WSL 实例一直存活，这是微软明确的 WSL 生命周期限制。手动调用且不需要保持进程时可传 `-NoKeepAlive`。[微软 systemd 生命周期说明](https://learn.microsoft.com/en-us/windows/wsl/systemd)
+
+当前脚本已完成本地静态审查；Windows 任务计划程序及本次产品化后的 WSL 常驻路径需在目标机器重新验收。
+
+## 9. 故障定位
+
+| 现象 | 检查与处理 |
+| --- | --- |
+| `torch.version.cuda` 是 `None` | 装到了 CPU torch；停止服务，将错误 `.venv` 移走后按完整部署重建，保留模型缓存 |
+| `nvidia-smi` 成功，CUDA tensor 仍失败 | 检查 CUDA wheel 与显卡架构；新卡需要支持它的官方 CUDA wheel，不退回 CPU torch |
+| 模型加载失败，日志指向离线缓存 | 临时取消 offline 设置，在线完成该模型 smoke，再恢复离线 |
+| systemd 显示 active，health 不通 | 查看 journal，确认当前 checkout 的 `.venv/bin/uvicorn` 路径和 `18080` 监听 |
+| localhost 成功，LAN 不通 | 核对 mirrored、Windows LAN IP、专用网络及 Hyper-V 单端口规则 |
+| MOSS 未出现在模型发现中 | 完成 MOSS smoke，确认 unit 读取的 checkout `.env` 有 `ASR_ENABLE_MOSS=1` 并重启 |
+| 长任务查不到 job | job 只保存在内存，重启或 TTL 到期后须重新提交 |
+
+现有 GPU 验收记录描述当时的硬件与固定模型 snapshot，不等于所有 NVIDIA/WSL 环境兼容保证。API 合约见 [PRD](asr-server-prd.md)，Qwen 运行时验收见 [HF native 记录](validation-2026-07-02-wsl-hf-native.md)。

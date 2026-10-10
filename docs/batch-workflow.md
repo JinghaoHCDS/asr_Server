@@ -1,6 +1,6 @@
 # 口播、播客与批量交接工作流
 
-本工作流保留“Mac 管素材和结果，WSL 只做 GPU 推理”的边界。调用前先读取 `GET /v1/models`；`oral_analysis` 需要某个模型声明 `forced_alignment=true`，`podcast` 需要某个模型声明 `diarization=true` 且支持 `speaker_resolution=auto`。能力不存在时客户端明确失败，不会静默降级。
+本工作流保留“客户端管理素材和结果，WSL 做 GPU 推理”的边界。调用前先读取 `GET /v1/models`；`oral_analysis` 需要某个模型声明 `forced_alignment=true`，`podcast` 需要某个模型声明 `diarization=true` 且支持 `speaker_resolution=auto`。能力不存在时客户端明确失败，不会静默降级。
 
 ## WSL 开关
 
@@ -18,8 +18,8 @@ ASR_ENABLE_MOSS=1
 
 ```bash
 uv run python scripts/asr_client.py \
-  --base-url http://192.168.31.137:18080 \
-  job /Users/me/media/oral-001.wav \
+  --base-url http://YOUR_WINDOWS_LAN_IP:18080 \
+  job /path/to/media/oral-001.wav \
   --purpose oral_analysis \
   --language auto \
   --context '视频简介提到 Qwen3-ASR 和 RTX 5070 Ti；仅作词汇参考。' \
@@ -32,8 +32,8 @@ uv run python scripts/asr_client.py \
 
 ```bash
 uv run python scripts/asr_client.py \
-  --base-url http://192.168.31.137:18080 \
-  job /Users/me/media/podcast-001.m4a \
+  --base-url http://YOUR_WINDOWS_LAN_IP:18080 \
+  job /path/to/media/podcast-001.m4a \
   --purpose podcast \
   --context '一期讨论 Apple Silicon、MLX 与 CUDA。' \
   --hotwords '["Apple Silicon","MLX","CUDA"]' \
@@ -48,17 +48,17 @@ uv run python scripts/asr_client.py \
 
 ```bash
 curl --noproxy '*' -sS \
-  'http://192.168.31.137:18080/v1/jobs/JOB_ID?detail=compact'
+  'http://YOUR_WINDOWS_LAN_IP:18080/v1/jobs/JOB_ID?detail=compact'
 ```
 
 任务结束后只获取一次完整结果：
 
 ```bash
 curl --noproxy '*' -sS \
-  'http://192.168.31.137:18080/v1/jobs/JOB_ID?detail=full'
+  'http://YOUR_WINDOWS_LAN_IP:18080/v1/jobs/JOB_ID?detail=full'
 ```
 
-服务端 job 仍是内存态并按 TTL 清理。Mac 批量工具保存 job ID；遇到 `job_not_found` 会按同一缓存键和幂等键重新提交。
+服务端 job 仍是内存态并按 TTL 清理。客户端批量工具保存 job ID；遇到 `job_not_found` 会按同一缓存键和幂等键重新提交。
 
 ## 批量清单
 
@@ -69,7 +69,7 @@ curl --noproxy '*' -sS \
   "items": [
     {
       "id": "creator-episode-001",
-      "path": "/Users/me/media/001.wav",
+      "path": "/path/to/media/001.wav",
       "title": "样例标题",
       "source": "https://example.invalid/item/001",
       "description": "原始简介，仅供审计",
@@ -87,7 +87,7 @@ curl --noproxy '*' -sS \
 ```bash
 uv run python scripts/batch_transcribe.py batch.json \
   --output output \
-  --base-url http://192.168.31.137:18080 \
+  --base-url http://YOUR_WINDOWS_LAN_IP:18080 \
   --max-in-flight 4 \
   --poll-seconds 10
 ```
@@ -97,7 +97,7 @@ uv run python scripts/batch_transcribe.py batch.json \
 ```bash
 uv run python scripts/batch_transcribe.py batch.json \
   --output output \
-  --base-url http://192.168.31.137:18080 \
+  --base-url http://YOUR_WINDOWS_LAN_IP:18080 \
   --retry-failed
 ```
 

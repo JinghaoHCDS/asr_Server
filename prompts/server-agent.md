@@ -1,17 +1,19 @@
 # 服务端 Agent 提示词
 
-你是在 Windows 主机的 WSL Arch Linux 内工作的开发代理。你的任务是实现一个常驻后台的 ASR 服务，让局域网内 Mac mini 可以访问 Windows/WSL 里的 GPU ASR 模型。
+部署路径和 LAN IP 由用户环境决定；示例 `YOUR_WINDOWS_LAN_IP` 与 `/path/to/` 必须替换。历史 Mac / Arch 验收不代表其他平台已实测。
+
+你是在 Windows 主机的 WSL Arch Linux 内工作的开发代理。你的任务是实现一个常驻后台的 ASR 服务，让局域网 Agent 和客户端 可以访问 Windows/WSL 里的 GPU ASR 模型。
 
 工作目录：
 
 ```bash
-/home/fragt/services/asr-server
+~/services/asr-server
 ```
 
 目标入口：
 
 ```text
-http://192.168.31.137:18080
+http://YOUR_WINDOWS_LAN_IP:18080
 ```
 
 必须阅读并遵守 PRD：
@@ -40,7 +42,7 @@ docs/validation-2026-07-15-wsl-moss-long-form.md
 - 使用 uv 管理环境。
 - 使用 FastAPI + Uvicorn 实现 HTTP API。
 - 服务监听 `0.0.0.0:18080`。
-- 不要把项目放在 `/mnt/c` 下，放在 WSL 原生文件系统 `/home/fragt/services/asr-server`。
+- 不要把项目放在 `/mnt/c` 下，放在 WSL 原生文件系统 `~/services/asr-server`。
 - 第一版优先做稳定的离线转写，不要一开始就实现 Web UI。
 - 模型包很重，安装前先检查磁盘空间、CUDA、`nvidia-smi`。
 - RTX 5070 Ti 较新，必须显式安装并验证 CUDA 版 torch，防止误装 CPU 版 torch。
@@ -61,7 +63,7 @@ MiMo-V2.5-ASR 不进入当前交付范围；不要把 MiMo 写进 `/v1/models`�
 先验收 torch CUDA，再安装 Qwen/MOSS 运行时依赖。`nvidia-smi` 只能证明 WSL 能看到驱动和显卡，不能证明 Python 环境里的 torch 是 CUDA 版。不要直接裸跑 `pip install torch`，必须使用 PyTorch 官方 CUDA wheel 源，例如 CUDA 12.8 的 `cu128`：
 
 ```bash
-cd /home/fragt/services/asr-server
+cd ~/services/asr-server
 
 uv python install 3.12
 uv sync
@@ -143,7 +145,7 @@ DELETE /v1/jobs/{job_id}
 
 异步 job 已进入当前服务行为，维护时必须保持以下语义：
 
-- `POST /v1/audio/transcription-jobs` 快速返回 `202 Accepted`、`job_id`、`status_url`，不要在这个 HTTP 请求内执行完整转录。
+- `POST /v1/audio/transcription-jobs` 快速返回 `202 Accepted`、`id`、`status_url`，不要在这个 HTTP 请求内执行完整转录。
 - `GET /v1/jobs/{job_id}` 返回 job 状态、队列位置、阶段、chunk 级进度、错误或最终结果。
 - `DELETE /v1/jobs/{job_id}` 支持保守取消；正在模型推理的 chunk 不要强杀，等当前 chunk 完成后停止后续 chunk。
 - 只做内存 JobManager 和单 worker FIFO 队列；不要引入 Redis、Celery、数据库、多 worker 或多 GPU 调度。
@@ -200,7 +202,7 @@ README.md
 开发顺序：
 
 1. 阅读现有 Mac 侧实现和测试，保留 API 合约、错误信封、生命周期语义。
-2. 在 WSL Arch Linux 的 `/home/fragt/services/asr-server` 部署项目，不要放在 `/mnt/c`。
+2. 在 WSL Arch Linux 的 `~/services/asr-server` 部署项目，不要放在 `/mnt/c`。
 3. 检查磁盘空间、CUDA、`nvidia-smi`、Python 3.12、uv。
 4. 先用 `scripts/qwen_asr_backend_smoke.py` 跑通 HF native `transformers` 最小转录流程。
 5. 维护 Qwen3-ASR 适配器，真实跑通 `qwen3-asr-0.6b` 与 `qwen3-asr-1.7b`。
@@ -217,14 +219,14 @@ README.md
 uv run pytest -q
 uv run uvicorn asr_server.main:app --host 0.0.0.0 --port 18080
 curl --noproxy '*' http://127.0.0.1:18080/health
-curl --noproxy '*' http://192.168.31.137:18080/v1/models
+curl --noproxy '*' http://YOUR_WINDOWS_LAN_IP:18080/v1/models
 ```
 
 Mac mini 验收命令：
 
 ```bash
-curl --noproxy '*' -v http://192.168.31.137:18080/health
-curl --noproxy '*' -v http://192.168.31.137:18080/v1/models
+curl --noproxy '*' -v http://YOUR_WINDOWS_LAN_IP:18080/health
+curl --noproxy '*' -v http://YOUR_WINDOWS_LAN_IP:18080/v1/models
 ```
 
 交付物：
@@ -245,3 +247,11 @@ curl --noproxy '*' -v http://192.168.31.137:18080/v1/models
 - 不要默认经过代理访问局域网 IP。
 - 不要在活跃请求还没结束时强行卸载模型。
 - 不要在 `/v1/models` 中声明未真实跑通的模型、后端或高级能力。
+
+## 当前 job / 能力与鉴权合约
+
+创建响应的任务标识字段是 `id`，路径中的 `{job_id}` 使用该值。轮询使用 `detail=compact`；completed 后请求一次 `detail=full` 读取 `result.text`。如需已完成 chunk 的文字，也使用 full。任务在内存中保存，重启后丢失，不能承诺服务端断点续算。
+
+使用 `purpose=podcast` 时，REST 必须显式选择已声明的 MOSS 模型；它不会自动从默认 Qwen 切换模型。读取 `diarization.status` 和 `speaker_scope`，保留 partial / mixed / unresolved；4–5 小时整期一致性仍未完成完整实测。
+
+启用 `ASR_API_TOKEN` 时，所有 `/v1/**` 请求提供 Bearer 凭据；客户端 CLI 用 `ASR_TOKEN`，MCP 用 `ASR_MCP_TOKEN`。`.env` 只有部署生成的 systemd unit 会读取，客户端和直接 Python 启动不自动加载。

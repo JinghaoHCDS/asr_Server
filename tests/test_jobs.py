@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import threading
 import wave
 from array import array
 from collections.abc import AsyncIterator
@@ -15,6 +16,7 @@ from httpx import ASGITransport, AsyncClient
 from asr_server import main as main_module
 from asr_server.adapters.base import TranscriptionResult
 from asr_server.adapters.mock import MockAsrAdapter
+from asr_server.audio.workspace import AudioWorkspace
 from asr_server.config import Settings
 from asr_server.errors import AsrError
 from asr_server.main import create_app
@@ -380,6 +382,193 @@ async def test_failed_job_removes_uploaded_temp_files(
         await wait_for_status(client, str(created["id"]), {"failed"})
 
     assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("terminal_status", ["completed", "failed", "cancelled"])
+async def test_running_job_publishes_terminal_state_only_after_workspace_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    terminal_status: str,
+) -> None:
+    patch_job_tempdir(monkeypatch, tmp_path)
+    inference_entered = asyncio.Event()
+    allow_inference = threading.Event()
+    loop = asyncio.get_running_loop()
+    cleanup_entered = asyncio.Event()
+    allow_cleanup = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+    original_transcribe = MockAsrAdapter.transcribe
+    original_cleanup = AudioWorkspace.cleanup
+
+    async def controlled_transcribe(
+        self: MockAsrAdapter,
+        audio: bytes,
+        *,
+        model_id: str,
+        backend: str,
+        language: str,
+        context: str,
+        max_new_tokens: int | None,
+    ) -> TranscriptionResult:
+        loop.call_soon_threadsafe(inference_entered.set)
+        assert allow_inference.wait(timeout=5), "test did not release controlled inference"
+        if terminal_status == "failed":
+            raise AsrError(503, "gpu_unavailable", "controlled inference failure", {"phase": "transcribing"})
+        return await original_transcribe(
+            self,
+            audio,
+            model_id=model_id,
+            backend=backend,
+            language=language,
+            context=context,
+            max_new_tokens=max_new_tokens,
+        )
+
+    async def controlled_cleanup(self: AudioWorkspace) -> None:
+        if not self._cleaned:
+            cleanup_entered.set()
+            await allow_cleanup.wait()
+        await original_cleanup(self)
+        cleanup_finished.set()
+
+    monkeypatch.setattr(MockAsrAdapter, "transcribe", controlled_transcribe)
+    monkeypatch.setattr(AudioWorkspace, "cleanup", controlled_cleanup)
+    app = create_app()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        try:
+            created = await create_job(client)
+            job_id = str(created["id"])
+            await asyncio.wait_for(inference_entered.wait(), timeout=5)
+            job = app.state.job_manager._jobs[job_id]
+            if terminal_status == "cancelled":
+                cancelled = await client.delete(f"/v1/jobs/{job_id}")
+                assert cancelled.json()["status"] == "cancel_requested"
+                assert not cleanup_entered.is_set()
+                assert job.upload_path.exists()
+            allow_inference.set()
+            await asyncio.wait_for(cleanup_entered.wait(), timeout=5)
+
+            pending = await client.get(f"/v1/jobs/{job_id}", params={"detail": "full"})
+            assert pending.status_code == 200
+            assert pending.json()["status"] not in {"completed", "failed", "cancelled"}
+            assert pending.json()["completed_at"] is None
+            assert pending.json()["expires_at"] is None
+            assert "result" not in pending.json()
+            assert job.upload_path.exists()
+            assert app.state.workspace_manager._reserved_upload_bytes == job.workspace.size_bytes
+
+            allow_cleanup.set()
+            await asyncio.wait_for(cleanup_finished.wait(), timeout=5)
+            terminal = await client.get(f"/v1/jobs/{job_id}", params={"detail": "full"})
+            assert terminal.json()["status"] == terminal_status
+            assert terminal.json()["completed_at"] is not None
+            assert terminal.json()["expires_at"] is not None
+            assert not job.work_dir.exists()
+            assert app.state.workspace_manager._reserved_upload_bytes == 0
+            if terminal_status == "completed":
+                assert terminal.json()["result"]["text"]
+            elif terminal_status == "failed":
+                assert terminal.json()["error"]["code"] == "gpu_unavailable"
+        finally:
+            allow_inference.set()
+            allow_cleanup.set()
+            await app.state.job_manager.shutdown()
+
+
+@pytest.mark.parametrize("cancel_method", ["delete", "shutdown"])
+async def test_queued_job_cancellation_publishes_terminal_state_only_after_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    cancel_method: str,
+) -> None:
+    patch_job_tempdir(monkeypatch, tmp_path)
+    inference_entered = asyncio.Event()
+    allow_inference = threading.Event()
+    loop = asyncio.get_running_loop()
+    cleanup_entered = asyncio.Event()
+    allow_cleanup = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+    cancelled_root: Path | None = None
+    original_transcribe = MockAsrAdapter.transcribe
+    original_cleanup = AudioWorkspace.cleanup
+
+    async def controlled_transcribe(
+        self: MockAsrAdapter,
+        audio: bytes,
+        *,
+        model_id: str,
+        backend: str,
+        language: str,
+        context: str,
+        max_new_tokens: int | None,
+    ) -> TranscriptionResult:
+        loop.call_soon_threadsafe(inference_entered.set)
+        assert allow_inference.wait(timeout=5), "test did not release controlled inference"
+        return await original_transcribe(
+            self,
+            audio,
+            model_id=model_id,
+            backend=backend,
+            language=language,
+            context=context,
+            max_new_tokens=max_new_tokens,
+        )
+
+    async def controlled_cleanup(self: AudioWorkspace) -> None:
+        if self.root == cancelled_root and not self._cleaned:
+            cleanup_entered.set()
+            await allow_cleanup.wait()
+            await original_cleanup(self)
+            cleanup_finished.set()
+        else:
+            await original_cleanup(self)
+
+    monkeypatch.setattr(MockAsrAdapter, "transcribe", controlled_transcribe)
+    monkeypatch.setattr(AudioWorkspace, "cleanup", controlled_cleanup)
+    app = create_app()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        cancel_task: asyncio.Task[Any] | None = None
+        try:
+            first = await create_job(client)
+            await asyncio.wait_for(inference_entered.wait(), timeout=5)
+            second = await create_job(client)
+            second_id = str(second["id"])
+            job = app.state.job_manager._jobs[second_id]
+            cancelled_root = job.work_dir
+            if cancel_method == "delete":
+                cancel_task = asyncio.create_task(client.delete(f"/v1/jobs/{second_id}"))
+            else:
+                cancel_task = asyncio.create_task(app.state.job_manager.shutdown())
+            await asyncio.wait_for(cleanup_entered.wait(), timeout=5)
+
+            pending = await client.get(f"/v1/jobs/{second_id}", params={"detail": "full"})
+            assert pending.json()["status"] == "cancel_requested"
+            assert pending.json()["completed_at"] is None
+            assert pending.json()["expires_at"] is None
+            assert job.upload_path.exists()
+            assert app.state.workspace_manager._reserved_upload_bytes > 0
+            assert second_id not in app.state.job_manager._queue
+
+            allow_cleanup.set()
+            await asyncio.wait_for(cleanup_finished.wait(), timeout=5)
+            terminal = await client.get(f"/v1/jobs/{second_id}", params={"detail": "full"})
+            assert terminal.json()["status"] == "cancelled"
+            assert terminal.json()["completed_at"] is not None
+            assert terminal.json()["expires_at"] is not None
+            assert not job.work_dir.exists()
+            first_job = app.state.job_manager._jobs[str(first["id"])]
+            assert app.state.workspace_manager._reserved_upload_bytes == first_job.workspace.size_bytes
+            allow_inference.set()
+            response = await asyncio.wait_for(cancel_task, timeout=5)
+            if cancel_method == "delete":
+                assert response.json()["status"] == "cancelled"
+        finally:
+            allow_inference.set()
+            allow_cleanup.set()
+            if cancel_task is not None:
+                await asyncio.wait_for(cancel_task, timeout=5)
+            await app.state.job_manager.shutdown()
+    assert app.state.workspace_manager._reserved_upload_bytes == 0
 
 
 async def test_queued_job_can_be_cancelled() -> None:

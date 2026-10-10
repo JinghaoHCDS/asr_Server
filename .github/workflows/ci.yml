@@ -26,4 +26,4 @@ jobs:
       - name: Unit and API tests
         run: uv run --frozen pytest -q
       - name: Static type checks
-        run: uv run --frozen mypy asr_server tests scripts
+        run: uv run --frozen mypy asr_server asr_mcp tests scripts

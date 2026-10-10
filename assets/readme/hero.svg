@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="600" viewBox="0 0 1200 600" role="img" aria-labelledby="title desc">
+  <title id="title">LAN ASR Server</title>
+  <desc id="desc">多个局域网 Agent 通过 HTTP 或本地 MCP，使用同一个 Windows WSL 服务和 NVIDIA GPU。Qwen 提供转录，MOSS 提供播客说话人分段。API 端口 18080。</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#457857"/></marker>
+  </defs>
+  <rect width="1200" height="600" rx="24" fill="#f3f5ee"/>
+  <g font-family="-apple-system,BlinkMacSystemFont,Segoe UI,PingFang SC,sans-serif" fill="#15231c">
+    <g id="project-title">
+      <text x="58" y="60" font-size="24" letter-spacing="3" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">WINDOWS / NVIDIA / WSL</text>
+      <text x="52" y="167" font-size="110" font-weight="760" letter-spacing="-5">LAN ASR SERVER</text>
+      <text x="58" y="227" font-size="38" font-weight="550">一台 GPU，让局域网的 Agent 都能转录。</text>
+    </g>
+    <path d="M58 266H1142" stroke="#c4cec1" stroke-width="2"/>
+    <g id="agent-clients">
+      <text x="58" y="312" font-size="24" fill="#53665b">CLIENTS</text>
+      <text x="58" y="371" font-size="36" font-weight="650">Agent / App</text>
+      <text x="58" y="415" font-size="27" fill="#53665b">HTTP · MCP bridge</text>
+      <path d="M62 463v-14m14 25v-41m14 52v-58m14 40v-24m14 10v-3m14 26v-53m14 71v-87m14 67v-47m14 42v-38m14 25v-12" stroke="#457857" stroke-width="6" stroke-linecap="round"/>
+    </g>
+    <path d="M315 389H390" fill="none" stroke="#457857" stroke-width="3" marker-end="url(#arrow)"/>
+    <g id="wsl-gateway">
+      <rect x="412" y="303" width="390" height="205" rx="14" fill="#152b20"/>
+      <text x="440" y="348" font-size="24" fill="#c0d3bd">WINDOWS → WSL</text>
+      <text x="440" y="405" font-size="43" fill="#f3f5ee" font-weight="650">ASR Gateway</text>
+      <text x="440" y="467" font-size="32" fill="#b2d48f" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">:18080 / FIFO</text>
+    </g>
+    <path d="M802 389H865" fill="none" stroke="#457857" stroke-width="3" marker-end="url(#arrow)"/>
+    <g id="model-backends">
+      <text x="893" y="340" font-size="24" fill="#53665b">MODELS</text>
+      <text x="893" y="389" font-size="34" font-weight="650">Qwen3-ASR</text>
+      <text x="893" y="441" font-size="34" font-weight="650">MOSS</text>
+      <text x="893" y="488" font-size="26" fill="#53665b">NVIDIA GPU</text>
+    </g>
+    <text x="58" y="561" font-size="25" fill="#53665b">音频留在自己的网络中，算力集中在自己的电脑上。</text>
+  </g>
+</svg>

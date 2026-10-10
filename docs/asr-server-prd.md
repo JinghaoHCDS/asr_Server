@@ -1,12 +1,12 @@
 # WSL ASR Server PRD
 
-更新时间：2026-09-19
+更新时间：2026-10-10
 
 2026-09 升级说明：本版把细粒度强制对齐、单期长播客全局说话人、逐素材 Context/关键词和 Mac 侧批量落盘纳入正式范围。本文后文若仍出现“初版不要求时间戳”的历史措辞，以本说明及对应能力发现字段为准。
 
 ## 1. 背景
 
-当前 Windows 主机已通过 WSL2 Arch Linux 暴露局域网服务，Mac mini 已验证可以访问 WSL mirrored networking 下的局域网服务。目标是在 WSL 内常驻一个 ASR 服务，让 Mac mini 上的本地项目可以通过 HTTP API 调用 Windows/WSL 内的 GPU 模型完成音频转录。
+面向 Windows + NVIDIA + WSL 用户提供常驻 ASR 服务，让局域网内的 Agent、应用和脚本通过 HTTP 调用同一台电脑的 GPU 转录能力。客户端可在支持 stdio MCP 的 Host 中运行本地 bridge。已实机验证的环境为 WSL2 Arch Linux + RTX 5070 Ti 16GB，以及 Mac mini 客户端；其他硬件和客户端平台需要独立验收。
 
 基础默认模型包含 Qwen3-ASR 两个尺寸：
 
@@ -16,16 +16,16 @@
 
 MiMo-V2.5-ASR 不进入初版交付范围，保留为后续扩展候选。
 
-硬件前提：
+历史验收基线（不是所有新用户的固定配置）：
 
 - Windows 主机：RTX 5070 Ti 16GB VRAM
 - WSL：Arch Linux，已启用 mirrored networking
 - WSL 资源：32GB RAM，12 CPUs，16GB swap
-- 局域网入口建议：`http://192.168.31.137:18080`
+- 历史验收入口：`http://192.168.31.137:18080`；新部署使用用户的 Windows LAN IP
 
 ## 2. 目标
 
-构建一个常驻 WSL 后台的统一 ASR 网关，让 Mac mini 可以通过稳定、可探测、可管理的 API 调用 WSL Arch Linux 上已验收的 GPU ASR 转录能力。
+构建一个常驻 WSL 后台的统一 ASR 网关，让局域网 Agent、应用和脚本通过可探测、可管理的 API 共用已验收的 GPU 转录能力。
 
 必须支持：
 
@@ -55,7 +55,7 @@ MiMo-V2.5-ASR 不进入初版交付范围，保留为后续扩展候选。
 
 ## 3. 用户与场景
 
-主要用户是 Mac mini 上的本地开发项目。
+服务部署者是拥有 Windows、NVIDIA GPU 和 WSL2 的用户；服务调用方是局域网内的 Agent 产品、应用和脚本。Mac mini 是已经实机验证的客户端，不是唯一目标用户。
 
 典型场景：
 
@@ -588,7 +588,7 @@ WebSocket /v1/audio/transcriptions/stream?model=qwen3-asr-1.7b&language=auto
 
 ### 6.11 服务端音频切分与合并
 
-请求端可以一次上传一个非无限长音频，或一次上传一个音频数组。切分、批处理、模型窗口适配、结果合并由 ASR server 负责；请求端不需要理解不同模型的推荐输入长度。
+请求端可以一次上传一个非无限长音频，或通过客户端清单逐项上传多个音频。切分、批处理、模型窗口适配、结果合并由 ASR server 负责；请求端不需要理解不同模型的推荐输入长度。
 
 设计原则：
 
@@ -599,7 +599,6 @@ WebSocket /v1/audio/transcriptions/stream?model=qwen3-asr-1.7b&language=auto
 
 输入字段扩展：
 
-- `files`：音频数组，可选；与单个 `file` 二选一。
 - `split_strategy`：`auto`、`none`、`fixed`、`silero`、`energy`、`vad`，默认 `auto`；`vad` 是兼容别名。生产 Path 管线当前优先使用 bounded streaming energy VAD；`silero` 在新的流式实现通过六小时 RSS 验收前会明确 fallback 到 energy 并返回 warning。
 - `max_chunk_seconds`：可选；用户给上限时不得超过服务端模型上限。
 - `overlap_seconds`：可选；默认由服务端决定。
@@ -627,9 +626,8 @@ WebSocket /v1/audio/transcriptions/stream?model=qwen3-asr-1.7b&language=auto
 同步与异步阈值：
 
 - 单个请求总音频时长小于等于 10 分钟时，允许走同步 `POST /v1/audio/transcriptions`。
-- 单个请求总音频时长超过 10 分钟时，同步接口应返回 `202 accepted` 并创建异步 job，响应包含 `job_id` 和 `status_url`；如果暂未实现自动创建 job，必须返回明确错误并提示客户端使用 `POST /v1/audio/transcription-jobs`。
+- 单个请求总音频时长超过 10 分钟时，同步接口应返回 `202 accepted` 并创建异步 job，响应包含 `id` 和 `status_url`；如果暂未实现自动创建 job，必须返回明确错误并提示客户端使用 `POST /v1/audio/transcription-jobs`。
 - 单文件默认最大 6 小时。
-- 单请求数组默认最多 50 个文件，总时长默认最多 6 小时。
 - 超过服务端限制返回 `413 audio_too_large` 或 `422 duration_limit_exceeded`。
 
 返回示例：
@@ -662,9 +660,9 @@ WebSocket /v1/audio/transcriptions/stream?model=qwen3-asr-1.7b&language=auto
 }
 ```
 
-### 6.12 Mac 侧 MCP Bridge
+### 6.12 客户端 MCP Bridge
 
-第一版 MCP 支持采用 Mac 侧 stdio bridge，不在 WSL FastAPI 中新增远程 MCP endpoint：
+MCP 支持采用客户端 stdio bridge（已实机验证 Mac），不在 WSL FastAPI 中新增远程 MCP endpoint：
 
 ```mermaid
 flowchart LR
@@ -677,7 +675,7 @@ flowchart LR
 
 - MCP 是现有 HTTP 接口的协议适配器，不替代 REST API，也不得重复实现模型生命周期、队列、切分、能力校验或推理逻辑。
 - `/v1/models` 仍是模型和能力真相来源；MCP Host 调用转录前应先执行能力发现。
-- bridge 运行在持有音频文件的 Mac 上，使用 multipart 把文件上传到 `18080`；不把本地音频转成 base64 放入 MCP JSON 参数。
+- bridge 运行在持有音频文件的客户端上，使用 multipart 把文件上传到 `18080`；不把本地音频转成 base64 放入 MCP JSON 参数。
 - bridge 使用 `httpx` 的 `trust_env=false` 访问局域网地址，避免 Mac 本机代理拦截请求。
 - WSL 不新增 MCP 端口，不开放 `8001`，也不恢复历史端口 `8765`。
 - 第一版不挂载远程 `/mcp`。后续若启用 Streamable HTTP MCP，必须先实现认证、`Origin` 校验和受控上传票据，并继续复用同一应用层实现。
@@ -722,6 +720,7 @@ stdio MCP tools：
 
 | HTTP | code | 场景 |
 | --- | --- | --- |
+| 401 | `unauthorized` | 启用 Token 时请求缺失或携带错误 Bearer 凭据 |
 | 400 | `bad_request` | 参数缺失、非法枚举值 |
 | 408 | `audio_probe_timeout` / `audio_preprocess_timeout` | ffprobe 或 FFmpeg 超过服务端 operation deadline |
 | 404 | `model_not_found` | 模型 ID 不存在 |
@@ -740,31 +739,15 @@ stdio MCP tools：
 
 ## 8. 运行与部署
 
-服务部署位置：
+部署脚本默认在当前 WSL checkout 原地安装；推荐位置为 `~/services/asr-server`，保持 Linux 原生文件系统。历史 `/home/fragt/services/asr-server` 不是产品固定路径。
 
-- WSL 内：`/home/fragt/services/asr-server`
+使用 Python 3.12、uv、FastAPI 和 Uvicorn。首次部署运行 `bash deploy/wsl-deploy.sh`，完成 CUDA 和 Qwen 独立 smoke 后安装 systemd user service。实际常驻使用部署目录 `.venv/bin/uvicorn`，避免启动时重新同步依赖。
 
-建议技术栈：
-
-- Python 3.12
-- FastAPI
-- Uvicorn
-- uv 管理 Python 环境
-- systemd user service 或 Windows 启动任务触发 `wsl -d archlinux`
-
-启动命令建议：
-
-```bash
-cd /home/fragt/services/asr-server
-uv run uvicorn asr_server.main:app --host 0.0.0.0 --port 18080
-```
-
-Windows 防火墙：
-
-- 需要允许专用网络入站 TCP `18080`。
-- 不需要为 `8001` 添加 Windows 防火墙入站规则；它只是未来可选的 WSL 内部 Qwen worker 通信端口。
-- 不需要保留或开放 `8765`；它只是此前连通性测试端口。
-- Mac 请求局域网服务时需要绕过本机代理，例如 `curl --noproxy '*' http://192.168.31.137:18080/health`。
+- Windows 11 22H2+ 配置 mirrored networking；只允许专用网络 TCP `18080`。
+- 不开放 worker `8001` 或历史测试端口。
+- 客户端使用 Windows 主机实际 LAN IP，并绕过本机代理；本地默认地址是 `http://127.0.0.1:18080`。
+- 真实模式需要显式 `ASR_ADAPTER=qwen`；默认 mock 仅用于无 GPU 开发。
+- 完整部署、WSL 保活和 Windows 启动配置以 `docs/wsl-deployment.md` 为准。
 
 ## 9. 后台常驻要求
 
@@ -782,7 +765,7 @@ Windows 防火墙：
 server:
   host: 0.0.0.0
   port: 18080
-  public_base_url: http://192.168.31.137:18080
+  public_base_url: http://YOUR_WINDOWS_LAN_IP:18080
 
 models:
   default: qwen3-asr-1.7b
@@ -802,7 +785,9 @@ limits:
 
 由于服务只给局域网使用，第一版可使用轻量认证：
 
-- 支持可选 `Authorization: Bearer <token>`。
+- 设置 `ASR_API_TOKEN` 后 `/v1/**` 必须提供正确的 `Authorization: Bearer <token>`；缺失或错误返回 `401 unauthorized` 错误信封，并在读取上传正文前拒绝。未配置时保持现有无认证行为。
+- `/health`、`/docs`、`/openapi.json` 和 MCP 配置文档公开；启用 Token 时 Swagger 提供 Authorize。CLI / batch 使用 `ASR_TOKEN`，MCP 使用 `ASR_MCP_TOKEN`。
+- 部署的 systemd unit 从可选 `.env` 读取环境；直接 Python / Uvicorn 与 MCP Host 不会自动读取 `.env`。
 - 默认只监听局域网地址或 `0.0.0.0` 配合 Windows 专用网络防火墙。
 - 不允许公网端口映射。
 - 上传音频写入临时目录，推理结束后清理。
@@ -815,8 +800,8 @@ limits:
 
 连通性：
 
-- Mac mini 执行 `curl --noproxy '*' http://192.168.31.137:18080/health` 返回 `status=ok`。
-- Mac mini 执行 `curl --noproxy '*' http://192.168.31.137:18080/v1/models` 能看到 `qwen3-asr-0.6b` 与 `qwen3-asr-1.7b`。
+- Mac mini 执行 `curl --noproxy '*' http://YOUR_WINDOWS_LAN_IP:18080/health` 返回 `status=ok`。
+- Mac mini 执行 `curl --noproxy '*' http://YOUR_WINDOWS_LAN_IP:18080/v1/models` 能看到 `qwen3-asr-0.6b` 与 `qwen3-asr-1.7b`。
 - 当 WSL 服务设置 `ASR_ENABLE_MOSS=1` 且 MOSS smoke 验收通过时，`/v1/models` 能看到 `moss-transcribe-diarize-0.9b`。
 - `/v1/models` 不展示未进入初版交付范围的 MiMo 模型，也不声明未验收通过的高级能力。
 
@@ -832,7 +817,7 @@ limits:
 
 异步 job：
 
-- Mac mini 能创建 `POST /v1/audio/transcription-jobs`，拿到 `202`、`job_id` 和 `status_url`。
+- Mac mini 能创建 `POST /v1/audio/transcription-jobs`，拿到 `202`、`id` 和 `status_url`。
 - `GET /v1/jobs/{job_id}` 能看到 `queued`、运行中状态和最终 `completed`。
 - chunked 长音频中，`progress.total_chunks`、`completed_chunks`、`current_chunk` 会随真实 chunk 完成而变化；native long-form 单次模型调用只报告真实阶段，不伪造 chunk 内百分比。
 - chunked 长音频每完成一个 chunk 后，`progress.chunk_text` 返回该分片文本，`progress.text` 返回累计临时文本，`progress.chunks` 返回可恢复的有序已完成分片；最终结果仍以 `result.text` 为准。
@@ -898,4 +883,4 @@ MCP：
 - MOSS-Transcribe-Diarize GitHub：https://github.com/OpenMOSS/MOSS-Transcribe-Diarize
 - MOSS-Transcribe-Diarize Hugging Face：https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize
 - MiMo-V2.5-ASR GitHub：https://github.com/XiaomiMiMo/MiMo-V2.5-ASR
-- WSL mirrored networking 已在本机验证，正式 ASR 服务入口规划为 `192.168.31.137:18080`
+- WSL mirrored networking 已在本机验证，历史验收入口为 `192.168.31.137:18080`，产品运行地址由用户配置

@@ -4,7 +4,7 @@ import asyncio
 import os
 import shutil
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from fastapi import UploadFile
@@ -23,13 +23,32 @@ class AudioWorkspace:
     size_bytes: int
     _manager: WorkspaceManager
     _cleaned: bool = False
+    _cleanup_task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
 
     async def cleanup(self) -> None:
         if self._cleaned:
             return
-        self._cleaned = True
+        if self._cleanup_task is None or self._cleanup_task.done():
+            self._cleanup_task = asyncio.create_task(self._cleanup())
+        cleanup_task = self._cleanup_task
+        # All callers join the same deletion and budget release, including
+        # cancelled callers; terminal job states must not precede file cleanup.
+        cancelled = False
+        while True:
+            try:
+                await asyncio.shield(cleanup_task)
+                break
+            except asyncio.CancelledError:
+                if cleanup_task.cancelled():
+                    raise
+                cancelled = True
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def _cleanup(self) -> None:
         await asyncio.to_thread(shutil.rmtree, self.root, True)
         await self._manager.release(self.size_bytes)
+        self._cleaned = True
 
 
 class WorkspaceManager:
