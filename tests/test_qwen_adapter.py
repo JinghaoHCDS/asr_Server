@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from asr_server.adapters.base import AudioPath
-from asr_server.adapters.qwen import MODEL_REPOS, QwenAsrAdapter, _QwenWorkerBackend
+from asr_server.adapters.base import AudioPath, TimestampItem
+from asr_server.adapters.qwen import MODEL_REPOS, QwenAsrAdapter, _HfNativeQwenModel, _QwenWorkerBackend
 from asr_server.errors import AsrError
 
 
@@ -233,6 +233,103 @@ async def test_qwen_load_uses_hf_native_transformers_without_qwen_asr(monkeypatc
     assert ("dtype", "bf16") in calls
     assert ("device", "cuda") in calls
     assert ("generate", 77) in calls
+    assert not any(key == "audio" for key, _value in calls), "auto must keep using the generation-prompt path"
+    template_kwargs = next(value for key, value in calls if key == "chat_template_kwargs")
+    assert template_kwargs == {"add_generation_prompt": True, "tokenize": True, "return_dict": True}
+
+
+@pytest.mark.parametrize("context", ["", "domain terms"])
+@pytest.mark.parametrize(
+    ("language", "decoded_language", "expected_language"),
+    [("zh", None, "zh"), ("en", None, "en"), ("Chinese", None, "Chinese"), ("zh", "English", "English")],
+)
+async def test_explicit_language_preserves_native_request_and_alignment_language(
+    monkeypatch: pytest.MonkeyPatch, language: str, decoded_language: str | None,
+    expected_language: str, context: str,
+) -> None:
+    calls: dict[str, object] = {}
+
+    class Processor:
+        chat_template = "checkpoint template which does not render assistant turns"
+
+        def apply_transcription_request(
+            self, *, audio: str, language: str, prompt: str | None = None,
+            chat_template: str | None = None,
+        ) -> FakeHfInputs:
+            calls.update(audio=audio, language=language, prompt=prompt, chat_template=chat_template)
+            return FakeHfInputs(input_ids=SimpleNamespace(shape=[1, 2]))
+
+        def apply_chat_template(self, *_args: object, **_kwargs: object) -> None:
+            raise AssertionError("explicit language must retain the native helper and its language normalization")
+
+        def decode(self, _ids: object, *, return_format: str) -> list[dict[str, str | None]]:
+            assert return_format == "parsed"
+            return [{"language": decoded_language, "transcription": "hello"}]
+
+    class Model:
+        device = "cuda"
+        dtype = "bf16"
+
+        def generate(self, **kwargs: object) -> object:
+            assert kwargs["max_new_tokens"] == 42
+
+            class Output:
+                def __getitem__(self, _key: object) -> str:
+                    return "generated"
+
+            return Output()
+
+    processor = Processor()
+    adapter = _QwenWorkerBackend("qwen3-asr-0.6b", enable_alignment=True)
+    adapter._model = _HfNativeQwenModel(processor=processor, model=Model(), torch=SimpleNamespace(), max_new_tokens=42)
+    alignment_languages: list[str] = []
+
+    def align(_audio: str, transcript: str, detected_language: str, *, requested_granularity: str) -> tuple[list[TimestampItem], list[str]]:
+        assert transcript == "hello" and requested_granularity == "auto"
+        alignment_languages.append(detected_language)
+        return [TimestampItem("hello", 0, 1, "word")], []
+
+    monkeypatch.setattr(adapter, "_align", align)
+    result = await adapter.transcribe(b"audio", model_id="qwen3-asr-0.6b", backend="transformers",
+                                      language=language, context=context, timestamps="auto")
+    assert calls["language"] == language and calls["prompt"] == (context or None)
+    assert isinstance(calls["chat_template"], str) and calls["chat_template"] != processor.chat_template
+    assert result.text == "hello" and result.language == expected_language
+    assert alignment_languages == [expected_language]
+    assert result.timestamps == [TimestampItem("hello", 0, 1, "word")]
+
+
+@pytest.mark.parametrize("original_renders_assistant", [False, True])
+def test_prefill_template_keeps_context_audio_and_one_open_assistant_turn(original_renders_assistant: bool) -> None:
+    # Transformers provides Jinja in WSL; keep the Mac base environment lightweight.
+    jinja2 = pytest.importorskip("jinja2")
+    from asr_server.adapters.qwen import _qwen_prefill_chat_template
+
+    original_template = (
+        "{%- for message in messages %}"
+        "{%- if message.role in ['system', 'user'] or render_assistant %}"
+        "{{ '<|im_start|>' + message.role + '\\n' }}"
+        "{%- for part in message.content %}"
+        "{%- if part.type == 'text' %}{{ part.text }}"
+        "{%- elif part.type == 'audio' %}{{ '<|audio_start|><|audio_pad|><|audio_end|>' }}{% endif %}"
+        "{%- endfor %}{{ '<|im_end|>\\n' }}"
+        "{%- endif %}{%- endfor %}"
+        "{%- if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{% endif %}"
+    )
+    messages = [
+        {"role": "system", "content": [{"type": "text", "text": "domain terms"}]},
+        {"role": "user", "content": [{"type": "audio", "audio": "speech.wav"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "language Chinese<asr_text>"}]},
+    ]
+    processor = SimpleNamespace(chat_template=original_template)
+    rendered = jinja2.Environment().from_string(_qwen_prefill_chat_template(processor)).render(
+        messages=messages, add_generation_prompt=False, render_assistant=original_renders_assistant,
+    )
+    assert rendered == (
+        "<|im_start|>system\ndomain terms<|im_end|>\n"
+        "<|im_start|>user\n<|audio_start|><|audio_pad|><|audio_end|><|im_end|>\n"
+        "<|im_start|>assistant\nlanguage Chinese<asr_text>"
+    )
 
 
 async def test_qwen_load_rejects_unsupported_dtype(monkeypatch: pytest.MonkeyPatch) -> None:

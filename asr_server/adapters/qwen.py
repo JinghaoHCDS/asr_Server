@@ -856,6 +856,29 @@ class _QwenTranscriptionItem:
     generation: GenerationMetrics
 
 
+def _qwen_prefill_chat_template(processor: Any) -> str:
+    """Preserve native audio rendering while retaining the language prefill.
+
+    The pinned HF checkpoints' templates omit assistant messages, whereas
+    apply_transcription_request uses one for its normalized language prefix.
+    Render that turn exactly once without mutating the processor or cache.
+    """
+    template = getattr(processor, "chat_template", None)
+    if not isinstance(template, str) or not template:
+        raise RuntimeError("Qwen processor requires a text chat template for explicit language transcription")
+    return (
+        "{%- set asr_prefill_messages = messages -%}"
+        "{%- set messages = messages | rejectattr('role', 'equalto', 'assistant') | list -%}"
+        + template
+        + "{%- set messages = asr_prefill_messages -%}"
+        "{%- for m in messages if m.role == 'assistant' -%}"
+        "{{- '<|im_start|>assistant\\n' -}}"
+        "{%- if m.content is string -%}{{- m.content -}}"
+        "{%- else -%}{%- for c in m.content if c.type == 'text' -%}{{- c.text -}}{%- endfor -%}"
+        "{%- endif -%}{%- endfor -%}"
+    )
+
+
 class _HfNativeQwenModel:
     """Small adapter around the Qwen3-ASR Transformers native helper API."""
 
@@ -914,6 +937,7 @@ class _HfNativeQwenModel:
             )
             warnings.append("qwen_auto_language_uses_chat_template_generation_prompt")
         else:
+            request_kwargs["chat_template"] = _qwen_prefill_chat_template(self.processor)
             inputs = apply_request(**request_kwargs)
         inputs = inputs.to(self.model.device, self.model.dtype)
         output_ids = self.model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
@@ -951,7 +975,7 @@ class _HfNativeQwenModel:
             language = parsed.get("language", "")
             return _QwenTranscriptionItem(
                 text=text if isinstance(text, str) else str(text),
-                language=language if isinstance(language, str) else str(language),
+                language=language if isinstance(language, str) else "" if language is None else str(language),
                 warnings=warnings,
                 generation=generation,
             )

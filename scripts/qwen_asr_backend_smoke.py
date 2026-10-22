@@ -2,8 +2,14 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import sys
 from pathlib import Path
 from typing import Any
+
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from asr_server.adapters.qwen import _qwen_prefill_chat_template
 
 
 DEFAULT_MODEL = "Qwen/Qwen3-ASR-0.6B-hf"
@@ -54,7 +60,7 @@ def parsed_text(result: object) -> str:
 def parsed_language(result: object) -> str:
     if isinstance(result, dict):
         language = result.get("language", "")
-        return language if isinstance(language, str) else str(language)
+        return language if isinstance(language, str) else "" if language is None else str(language)
     language = getattr(result, "language", "")
     if not isinstance(language, str):
         return str(language)
@@ -112,6 +118,7 @@ def run_hf_native_transformers(args: argparse.Namespace) -> None:
             return_dict=True,
         ).to(model.device, model.dtype)
     else:
+        request["chat_template"] = _qwen_prefill_chat_template(processor)
         inputs = apply_request(**request).to(model.device, model.dtype)
     with torch.inference_mode():
         output_ids = model.generate(**inputs, max_new_tokens=args.max_new_tokens, do_sample=False)
@@ -119,7 +126,7 @@ def run_hf_native_transformers(args: argparse.Namespace) -> None:
     parsed = processor.decode(generated_ids, return_format="parsed")[0]
     print_result_summary(
         args,
-        language=parsed_language(parsed),
+        language=parsed_language(parsed) or normalize_language(args.language) or "",
         text=parsed_text(parsed),
     )
     if args.reject_hallucinated_term and args.reject_hallucinated_term.casefold() in parsed_text(parsed).casefold():
