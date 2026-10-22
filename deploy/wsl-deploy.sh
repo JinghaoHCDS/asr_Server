@@ -22,6 +22,7 @@ RUN_MYPY=1
 INSTALL_GPU_DEPS=1
 RUN_CUDA_CHECK=1
 INSTALL_SILERO=0
+INSTALL_QUALITY_VAD=0
 RUN_QWEN_BACKEND_SMOKE="${ASR_RUN_QWEN_BACKEND_SMOKE:-1}"
 ENABLE_SERVICE=1
 START_SERVICE=1
@@ -60,6 +61,7 @@ Options:
   --skip-gpu-deps               Do not install requirements/wsl-gpu-cu128.txt
   --skip-cuda-check             Do not run torch CUDA validation
   --install-silero              Install optional silero-vad package
+  --install-quality-vad         Install isolated quality_v1 CPU speech detector
   --skip-qwen-backend-smoke     Do not run scripts/qwen_asr_backend_smoke.py
   --smoke-model REPO            Qwen smoke model repo. Default: Qwen/Qwen3-ASR-0.6B-hf
   --smoke-audio PATH            Qwen smoke audio path. Default: test-fixtures/audio/test_short.wav
@@ -138,6 +140,10 @@ while [[ $# -gt 0 ]]; do
       INSTALL_SILERO=1
       shift
       ;;
+    --install-quality-vad)
+      INSTALL_QUALITY_VAD=1
+      shift
+      ;;
     --skip-qwen-backend-smoke)
       RUN_QWEN_BACKEND_SMOKE=0
       shift
@@ -191,7 +197,7 @@ done
 [[ "${TRANSFORMERS_OFFLINE}" == "0" || "${TRANSFORMERS_OFFLINE}" == "1" ]] || die "ASR_TRANSFORMERS_OFFLINE must be 0 or 1"
 
 # Fail before installing or syncing anything on a client machine.
-if [[ "${ADAPTER}" == "qwen" || "${INSTALL_GPU_DEPS}" == "1" || "${INSTALL_SILERO}" == "1" ]]; then
+if [[ "${ADAPTER}" == "qwen" || "${INSTALL_GPU_DEPS}" == "1" || "${INSTALL_SILERO}" == "1" || "${INSTALL_QUALITY_VAD}" == "1" ]]; then
   [[ "$(uname -s)" == "Linux" ]] || die "real inference deployment requires Windows WSL2; use --mock for CPU development"
   kernel_release="$(uname -r)"
   case "${kernel_release}" in
@@ -330,7 +336,12 @@ install_gpu_runtime() {
 
   if [[ "${INSTALL_SILERO}" == "1" ]]; then
     log "installing optional silero-vad"
-    uv pip install --no-deps silero-vad==6.2.3
+    uv pip install silero-vad==6.2.1
+  fi
+
+  if [[ "${INSTALL_GPU_DEPS}" == "1" || "${INSTALL_QUALITY_VAD}" == "1" ]]; then
+    log "installing isolated quality speech detector assets"
+    uv pip install --target "${ASR_QUALITY_VAD_DIR:-data/quality-vad/silero-vad-6.2.3}" --no-deps -r requirements/wsl-quality-vad.txt
   fi
 }
 

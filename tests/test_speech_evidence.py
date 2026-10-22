@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.metadata
+import sys
 import wave
 from array import array
 from contextlib import nullcontext
@@ -69,6 +70,8 @@ def write_wav(path: Path, samples: array[int], *, rate: int = 16000, channels: i
 
 @pytest.fixture
 def detector(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleNamespace]:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ASR_QUALITY_VAD_DIR", raising=False)
     model_path = tmp_path / "silero_vad.jit"
     model_path.write_bytes(b"test-only fake model")
     monkeypatch.setattr(speech_evidence, "_MODEL_SHA256", hashlib.sha256(model_path.read_bytes()).hexdigest())
@@ -110,6 +113,54 @@ def test_identity_verifies_package_and_artifact_without_loading_torch(detector: 
         "target_peak": 0.9, "max_gain": 100, "timeout_seconds": 60.0,
     }
     assert detector.imports == [] and detector.loads == []
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_isolated_bundle_is_verified_without_adding_import_paths_or_using_global_package(
+    detector: SimpleNamespace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, explicit: bool,
+) -> None:
+    identity = speech_evidence.detector_identity()
+    bundle = tmp_path / ("custom-vad" if explicit else "data/quality-vad/silero-vad-6.2.3")
+    bundle.mkdir(parents=True)
+    if explicit:
+        monkeypatch.setenv("ASR_QUALITY_VAD_DIR", str(bundle))
+    detector.distribution.metadata = {"Name": "silero_vad"}
+    searched: list[list[str]] = []
+    global_queries: list[str] = []
+
+    def distributions(*, path: list[str]) -> list[Any]:
+        searched.append(path)
+        return [detector.distribution]
+
+    def global_distribution(name: str) -> Any:
+        global_queries.append(name)
+        return detector.distribution
+
+    monkeypatch.setattr(importlib.metadata, "distributions", distributions)
+    monkeypatch.setattr(importlib.metadata, "distribution", global_distribution)
+    import_paths = sys.path.copy()
+    assert speech_evidence.detector_identity() == identity
+    assert searched and Path(searched[0][0]).resolve() == bundle.resolve()
+    assert sys.path == import_paths and detector.imports == [] and global_queries == []
+    detector.model_path.write_bytes(b"broken isolated model")
+    assert speech_evidence.detector_identity()["available"] is False
+    assert global_queries == []  # An invalid bundle must never fall back globally.
+
+
+@pytest.mark.parametrize("directory", ["missing-directory", "empty-directory", ""])
+def test_explicit_bad_bundle_never_falls_back_to_a_valid_global_install(
+    detector: SimpleNamespace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, directory: str,
+) -> None:
+    assert speech_evidence.detector_identity()["available"] is True
+    configured = tmp_path / directory if directory else None
+    if directory == "empty-directory":
+        assert configured is not None
+        configured.mkdir()
+    monkeypatch.setenv("ASR_QUALITY_VAD_DIR", str(configured) if configured is not None else "")
+    monkeypatch.setattr(importlib.metadata, "distributions", lambda **_kwargs: [])
+    assert speech_evidence.detector_identity()["available"] is False
+    assert speech_evidence.non_speech_evidence(detector.path, 0, 1) is None
+    assert detector.imports == []
 
 
 @pytest.mark.parametrize("failure", ["missing", "wrong_version", "wrong_hash", "missing_model"])

@@ -10,7 +10,6 @@ soundfile==0.14.0
 librosa==0.11.0
 av==17.1.0
 soxr==1.1.0
-silero-vad==6.2.3
 numpy==2.4.6
 numba==0.65.1
 llvmlite==0.47.0

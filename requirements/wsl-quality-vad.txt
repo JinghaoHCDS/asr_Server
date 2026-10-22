@@ -1,0 +1,4 @@
+# Install into data/quality-vad/silero-vad-6.2.3 with --target and --no-deps.
+# Keep this off sys.path so legacy/MOSS optional VAD discovery stays unchanged.
+# The CPU detector uses the existing, validated CUDA torch runtime.
+silero-vad==6.2.3

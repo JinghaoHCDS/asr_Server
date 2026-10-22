@@ -9,6 +9,8 @@ import hashlib
 import importlib
 import importlib.metadata
 import math
+import os
+import re
 import sys
 import threading
 import wave
@@ -42,7 +44,26 @@ def _identity(*, available: bool) -> dict[str, object]:
 
 def _verified_model() -> tuple[dict[str, object], Path] | None:
     try:
-        distribution = importlib.metadata.distribution("silero-vad")
+        configured_directory = os.environ.get("ASR_QUALITY_VAD_DIR")
+        directory = Path("data/quality-vad/silero-vad-6.2.3")
+        if configured_directory is not None:
+            if not configured_directory.strip():
+                return None
+            directory = Path(configured_directory).expanduser()
+        if configured_directory is not None or directory.exists():
+            if not directory.is_dir():
+                return None
+            # An isolated model bundle must not enter sys.path: legacy VAD
+            # discovery must remain independent of this quality-only detector.
+            matches = [
+                item for item in importlib.metadata.distributions(path=[str(directory)])
+                if re.sub(r"[-_.]+", "-", item.metadata.get("Name", "")).lower() == "silero-vad"
+            ]
+            if len(matches) != 1:
+                return None
+            distribution = matches[0]
+        else:
+            distribution = importlib.metadata.distribution("silero-vad")
         if distribution.version != _VERSION:
             return None
         path = Path(str(distribution.locate_file("silero_vad/data/silero_vad.jit")))
