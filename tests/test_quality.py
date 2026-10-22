@@ -430,3 +430,44 @@ async def test_overlapping_digital_silence_does_not_require_fabricated_alignment
         assert len(adapter.calls) == 3  # Every overlapping input was actually recognized.
     finally:
         await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_reviewed_empty_audio_uses_independent_evidence_and_keeps_audit_on_resume(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    class EmptyAdapter(RecordingAdapter):
+        async def transcribe(self, audio: AudioInput, *, model_id: str, backend: str, language: str, context: str, timestamps: str = "none", max_new_tokens: int | None = None) -> TranscriptionResult:
+            self.calls.append(max_new_tokens)
+            raise AsrError(422, "empty_transcription", "no text")
+
+    detector = {"available": True, "detector": "test-detector"}
+    inspected: list[tuple[float, float]] = []
+    def evidence(_path: Path, start: float, end: float, expected: dict[str, object]) -> dict[str, object]:
+        assert expected == detector
+        inspected.append((start, end))
+        return {"method": "silero_no_speech_detected", "detector_identity": detector, "views": 2}
+    monkeypatch.setattr("asr_server.quality.pipeline.detector_identity", lambda: detector)
+    monkeypatch.setattr("asr_server.quality.pipeline.non_speech_evidence", evidence)
+    source = tmp_path / "background.wav"
+    source.write_bytes(wav_bytes(240, amplitude=1000))
+    adapter = EmptyAdapter()
+    manager = ModelLifecycleManager(default_models(enable_qwen_alignment=True), lambda _: adapter, idle_unload_seconds=0)
+    try:
+        for _ in range(2):
+            result = await run_transcription_path(source, workspace=tmp_path, manager=manager, settings=Settings(), request=request(), checkpoint_dir=tmp_path / "checkpoints")
+            assert result["text"] == "" and result["timestamps"] == []
+            chunks = result["chunks"]
+            assert isinstance(chunks, list) and len(chunks) == 4
+            quality = result["quality"]
+            assert isinstance(quality, dict) and quality["status"] == "needs_review"
+            assert quality["review_audio_seconds"] == 60 and quality["review_budget_seconds"] == 72
+            issues = quality["issues"]
+            assert isinstance(issues, list) and len(issues) == 4
+            assert all(issue["kind"] == "empty_without_detected_speech" and issue["status"] == "needs_review" for issue in issues)
+        assert inspected == [(0, 60), (60, 120), (120, 180), (180, 240)]
+        assert len(adapter.calls) == 5  # Four full inputs and one bounded, failed subwindow.
+        monkeypatch.setattr("asr_server.quality.pipeline.detector_identity", lambda: {**detector, "available": False})
+        with pytest.raises(AsrError) as error:
+            await run_transcription_path(source, workspace=tmp_path, manager=manager, settings=Settings(), request=request(), checkpoint_dir=tmp_path / "checkpoints")
+        assert error.value.code == "checkpoint_version_mismatch"
+    finally:
+        await manager.shutdown()

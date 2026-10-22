@@ -330,7 +330,7 @@ install_gpu_runtime() {
 
   if [[ "${INSTALL_SILERO}" == "1" ]]; then
     log "installing optional silero-vad"
-    uv pip install silero-vad==6.2.1
+    uv pip install --no-deps silero-vad==6.2.3
   fi
 }
 

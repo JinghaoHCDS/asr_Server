@@ -19,6 +19,7 @@ from asr_server.quality.checkpoints import Checkpoints, file_digest, fingerprint
 from asr_server.quality.glossary import glossary_context, normalize_terms
 from asr_server.quality.splitter import QualityChunk, audio_has_energy, empty_audio_evidence, plan_quality_chunks
 from asr_server.quality.segments import reading_segments
+from asr_server.quality.speech_evidence import detector_identity, non_speech_evidence
 
 if TYPE_CHECKING:
     from asr_server.config import Settings
@@ -140,10 +141,12 @@ async def run_quality_transcription(
     context_report = glossary_report.pop("context")
     request_identity = asdict(request)
     request_identity.pop("idempotency_key", None)
+    speech_detector = await asyncio.to_thread(detector_identity)
     identity = await asyncio.to_thread(fingerprint, {
         "audio": await asyncio.to_thread(file_digest, normalized.path), "profile": PROFILE_VERSION,
         "model": checked.selected_model, "revision": model_revision, "aligner_revision": ALIGNER_REVISION, "request": request_identity,
         "chunks": [asdict(chunk) for chunk in chunks],
+        "speech_detector": speech_detector,
     })
     checkpoints = await asyncio.to_thread(Checkpoints, checkpoint_dir, identity)
     budget = sum(chunk.duration for chunk in chunks) * (0.30 if request.quality_review_enabled else 0.0)
@@ -248,6 +251,18 @@ async def run_quality_transcription(
                 else:
                     initial_error = retry_error
                     causes = [retry_error.code]
+            if request.quality_review_enabled and causes == ["empty_transcription"]:
+                fallback_evidence = await asyncio.to_thread(non_speech_evidence, normalized.path, chunk.start, chunk.end, speech_detector)
+                if fallback_evidence is not None:
+                    # Recognition has already covered this entire interval.
+                    # Independent, full-frame speech checks corroborate an
+                    # empty result, but never prove it correct: keep a review
+                    # marker and retain the original audio without adding text.
+                    result = TranscriptionResult("", chunk.duration, request.language, ["confirmed_empty_audio"])
+                    empty_audio_records.append({"method": "empty_audio", "start": chunk.start, "end": chunk.end,
+                                                "accepted": True, "evidence": fallback_evidence})
+                    initial_error = None
+                    causes = []
             chunk_reviews.extend({**record, "chunk_index": index} for record in empty_audio_records[empty_records_start:])
             reviews.extend(chunk_reviews)
             if initial_error or "generation_truncated" in causes or "empty_transcription" in causes:
@@ -256,9 +271,11 @@ async def run_quality_transcription(
             await asyncio.to_thread(checkpoints.save, index, result, chunk_reviews, chunk_extra)
         for record in chunk_reviews:
             evidence = record.get("evidence")
-            if record.get("method") == "empty_audio" and isinstance(evidence, dict) and evidence.get("method") == "near_digital_silence_tail":
-                all_issues.append({"kind": "near_silent_tail", "start": record["start"], "end": record["end"],
-                                   "chunk_index": index, "status": "needs_review", "evidence": evidence})
+            if record.get("method") == "empty_audio" and isinstance(evidence, dict):
+                kind = {"near_digital_silence_tail": "near_silent_tail", "silero_no_speech_detected": "empty_without_detected_speech"}.get(str(evidence.get("method")))
+                if kind:
+                    all_issues.append({"kind": kind, "start": record["start"], "end": record["end"],
+                                       "chunk_index": index, "status": "needs_review", "evidence": evidence})
         for cause in _issues(result, request.glossary_snapshot):
             all_issues.append({"kind": cause, "start": chunk.core_start, "end": chunk.core_end, "chunk_index": index, "status": "needs_review"})
         results.append(result)
@@ -373,7 +390,7 @@ async def run_quality_transcription(
     for item in timestamps:
         if float(str(item["start"])) < 0 or float(str(item["end"])) > duration + 0.2:
             raise AsrError(422, "alignment_failed", "timestamp lies outside source audio")
-    quality: dict[str, object] = {"profile_version": PROFILE_VERSION, "validated": False, "fingerprint": identity, "status": "needs_review" if all_issues else "complete", "issues": all_issues, "changes": changes, "reviews": reviews, "review_audio_seconds": extra_seconds, "review_budget_seconds": budget, "model_revision": model_revision, "aligner_revision": ALIGNER_REVISION}
+    quality: dict[str, object] = {"profile_version": PROFILE_VERSION, "validated": False, "fingerprint": identity, "status": "needs_review" if all_issues else "complete", "issues": all_issues, "changes": changes, "reviews": reviews, "review_audio_seconds": extra_seconds, "review_budget_seconds": budget, "model_revision": model_revision, "aligner_revision": ALIGNER_REVISION, "speech_detector": speech_detector}
     metadata = await asyncio.to_thread(inspect_audio_path, normalized.path)
     return {
         "id": f"tr_{uuid4().hex}", "model": checked.selected_model, "backend": checked.resolved_backend,
