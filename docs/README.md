@@ -1,12 +1,11 @@
 # 文档索引
 
-部署者从 README 和 WSL 指南开始；Agent 接入者从 MCP / 批量工作流开始。模型和能力始终以运行中的 `GET /v1/models` 为准。
+网页使用者从 [README](../README.md#使用工作台) 开始；部署者从 README 和 WSL 指南开始；Agent 接入者从 MCP / 批量工作流开始。模型和能力始终以运行中的 `GET /v1/models` 为准。
 
 ## 使用与维护
 
 - [局域网工作台与 Qwen 质量流程](product-workbench.md)：账号、断点上传、七天任务保留、回听改字与字幕导出。
 - [Qwen 质量评测](../evaluation/README.md)：开发/验收集、切分候选对照、CER/术语/字幕门槛。
-
 - [WSL 部署](wsl-deployment.md)：Windows / NVIDIA / WSL 前提、首次 GPU 验收、systemd、Windows 启动与局域网访问。
 - [MCP bridge](mcp-bridge.md)：客户端 stdio 配置、音频允许目录和八个工具。
 - [口播、播客与批量交接](batch-workflow.md)：逐素材 Context、恢复 / 重试、JSON + Markdown 输出。
@@ -19,6 +18,8 @@
 
 这些是对应版本和环境的历史证据，不代表所有硬件、发行版、模型或音频质量都已验证。
 
+- [2026-10-22 工作台本地工程验收](validation-2026-10-22-local-workbench.md)：mock 回归、浏览器流程、账号隔离、备份恢复与未验收项。
+- [2026-10-22 Qwen 质量流程与工作台实机验收](validation-2026-10-22-quality-workbench.md)：13.06 秒样本的真实转录、对齐、别名规范、编辑与字幕导出，不代表长音频质量达标。
 - [2026-07-02 Qwen HF native](validation-2026-07-02-wsl-hf-native.md)：0.6B / 1.7B 的 transformers 后端。
 - [2026-07-10 MOSS](validation-2026-07-10-wsl-moss.md)：独立 smoke、HTTP 路径与卸载。
 - [2026-07-10 稳定性审查](review-2026-07-10-stability-refactor.md)：单 GPU、worker、临时目录和 job 可靠性。
