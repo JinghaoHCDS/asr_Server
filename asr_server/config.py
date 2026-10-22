@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Literal, cast
 
 AdapterMode = Literal["mock", "qwen"]
@@ -33,6 +34,12 @@ class Settings:
     max_spool_mb: int = 12288
     max_workspace_mb: int = 1280
     max_workspace_files: int = 8
+    workbench_enabled: bool = True
+    workbench_data_dir: Path = Path("data/workbench")
+    workbench_retention_days: int = 7
+    workbench_max_upload_bytes: int = 8 * 1024**3
+    workbench_total_quota_bytes: int = 64 * 1024**3
+    workbench_user_quota_bytes: int = 16 * 1024**3
 
 
 def load_settings() -> Settings:
@@ -70,6 +77,14 @@ def load_settings() -> Settings:
     max_workspace_files = int(os.getenv("ASR_MAX_WORKSPACE_FILES", "8"))
     if min_free_disk_mb < 0 or max_spool_mb < 1 or max_workspace_mb < 1 or max_workspace_files < 1:
         raise ValueError("ASR disk and workspace limits must be non-negative/positive")
+    workbench_values = {
+        "workbench_retention_days": int(os.getenv("ASR_WORKBENCH_RETENTION_DAYS", "7")),
+        "workbench_max_upload_bytes": int(os.getenv("ASR_WORKBENCH_MAX_UPLOAD_BYTES", str(8 * 1024**3))),
+        "workbench_total_quota_bytes": int(os.getenv("ASR_WORKBENCH_TOTAL_QUOTA_BYTES", str(64 * 1024**3))),
+        "workbench_user_quota_bytes": int(os.getenv("ASR_WORKBENCH_USER_QUOTA_BYTES", str(16 * 1024**3))),
+    }
+    if any(value <= 0 for value in workbench_values.values()):
+        raise ValueError("ASR_WORKBENCH limits must be positive")
     return Settings(
         host=os.getenv("ASR_HOST", "0.0.0.0"),
         port=int(os.getenv("ASR_PORT", "18080")),
@@ -95,6 +110,12 @@ def load_settings() -> Settings:
         max_spool_mb=max_spool_mb,
         max_workspace_mb=max_workspace_mb,
         max_workspace_files=max_workspace_files,
+        workbench_enabled=_env_bool("ASR_WORKBENCH_ENABLED", default=True),
+        workbench_data_dir=Path(os.getenv("ASR_WORKBENCH_DATA_DIR", "data/workbench")),
+        workbench_retention_days=workbench_values["workbench_retention_days"],
+        workbench_max_upload_bytes=workbench_values["workbench_max_upload_bytes"],
+        workbench_total_quota_bytes=workbench_values["workbench_total_quota_bytes"],
+        workbench_user_quota_bytes=workbench_values["workbench_user_quota_bytes"],
     )
 
 

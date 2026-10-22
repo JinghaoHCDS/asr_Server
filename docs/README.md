@@ -4,6 +4,9 @@
 
 ## 使用与维护
 
+- [局域网工作台与 Qwen 质量流程](product-workbench.md)：账号、断点上传、七天任务保留、回听改字与字幕导出。
+- [Qwen 质量评测](../evaluation/README.md)：开发/验收集、切分候选对照、CER/术语/字幕门槛。
+
 - [WSL 部署](wsl-deployment.md)：Windows / NVIDIA / WSL 前提、首次 GPU 验收、systemd、Windows 启动与局域网访问。
 - [MCP bridge](mcp-bridge.md)：客户端 stdio 配置、音频允许目录和八个工具。
 - [口播、播客与批量交接](batch-workflow.md)：逐素材 Context、恢复 / 重试、JSON + Markdown 输出。

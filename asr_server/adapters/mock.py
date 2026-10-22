@@ -10,6 +10,7 @@ from asr_server.adapters.base import (
     AudioPath,
     ContextApplication,
     GenerationMetrics,
+    TimestampItem,
     TranscriptionResult,
     TranscriptionSegment,
     TranscriptionTimings,
@@ -35,6 +36,16 @@ class MockAsrAdapter:
 
     async def abort(self) -> None:
         self.loaded_backend = None
+
+    async def align_text(
+        self, audio: AudioInput, *, text: str, language: str = "auto", timestamps: str = "auto",
+    ) -> list[TimestampItem]:
+        del language, timestamps
+        if not text.strip():
+            return []
+        # One explicit mock item exercises edit/export plumbing. It does not
+        # impersonate word/character alignment and must never be quality proof.
+        return [TimestampItem(text, 0.0, audio_duration_seconds(audio), "segment", source="mock", status="mock")]
 
     async def transcribe(
         self,

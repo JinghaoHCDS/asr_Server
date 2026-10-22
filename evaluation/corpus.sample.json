@@ -1,0 +1,5 @@
+{
+  "schema_version": 1,
+  "description": "Copy this schema into a private local corpus manifest; no quality samples are bundled.",
+  "items": []
+}

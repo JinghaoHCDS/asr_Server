@@ -21,6 +21,10 @@ model_cache/
 hf_cache/
 .cache/
 transcripts/
+data/
+frontend/node_modules/
+frontend/dist/
+*.tsbuildinfo
 
 # Editor
 .idea/

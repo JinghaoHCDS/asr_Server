@@ -284,6 +284,7 @@ sync_source_tree() {
     --include '.env.example' \
     --exclude '.env.*' \
     --exclude 'data/' \
+    --exclude 'node_modules/' \
     "${SOURCE_DIR}/" "${DEPLOY_DIR}/"
 }
 

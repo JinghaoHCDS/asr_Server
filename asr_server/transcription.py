@@ -73,6 +73,10 @@ class TranscriptionRequest:
     purpose: str = "transcription"
     pause_threshold_seconds: float = 0.8
     idempotency_key: str | None = None
+    quality_profile: str = "legacy"
+    glossary_snapshot: dict[str, object] | None = None
+    quality_chunk_seconds: float | None = None
+    quality_review_enabled: bool = True
 
     @property
     def generation_config(self) -> GenerationConfig:
@@ -106,6 +110,8 @@ def validate_transcription_request(
     manager: ModelLifecycleManager,
     request: TranscriptionRequest,
 ) -> ValidatedTranscription:
+    if request.quality_profile not in {"legacy", "quality_v1"}:
+        raise AsrError(400, "bad_request", "unsupported quality_profile")
     if request.response_format not in {"json", "text", "verbose_json"}:
         raise AsrError(400, "bad_request", f"unsupported response_format: {request.response_format}")
     if request.timestamps not in {"none", "auto", "word", "char"}:
@@ -119,6 +125,15 @@ def validate_transcription_request(
     selected_model = request.model or manager.model_for_purpose(request.purpose)
     runtime = manager.runtime_for(selected_model)
     resolved_backend = manager.resolve_backend(runtime, request.backend)
+    if request.quality_profile == "quality_v1":
+        if not selected_model.startswith("qwen3-asr-"):
+            raise AsrError(422, "capability_not_supported", "quality_v1 requires a Qwen ASR model")
+        if not runtime.definition.capabilities.forced_alignment:
+            raise AsrError(422, "capability_not_supported", "quality_v1 requires enabled Qwen forced alignment")
+        if request.quality_chunk_seconds is not None and request.quality_chunk_seconds not in {30, 60, 90, 120, 180}:
+            raise AsrError(400, "bad_request", "quality_chunk_seconds must be 30, 60, 90, 120 or 180")
+        if request.overlap_seconds is not None and request.overlap_seconds not in {0, 1}:
+            raise AsrError(400, "bad_request", "quality_v1 context padding must be 0 or 1 second")
     if request.language not in runtime.definition.capabilities.languages:
         raise AsrError(
             422,
@@ -181,6 +196,18 @@ async def run_transcription(
     after_chunk: AfterChunkCallback | None = None,
 ) -> dict[str, object]:
     checked = validated or validate_transcription_request(manager, request)
+    if request.quality_profile == "quality_v1":
+        import tempfile
+
+        with tempfile.TemporaryDirectory(prefix="asr_quality_") as temporary:
+            root = Path(temporary)
+            source = root / "upload"
+            await asyncio.to_thread(source.write_bytes, audio)
+            return await run_transcription_path(
+                source, workspace=root, manager=manager, settings=settings, request=request,
+                validated=checked, stage_callback=stage_callback,
+                before_chunk=before_chunk, after_chunk=after_chunk,
+            )
     if request.speaker_resolution != "off":
         raise AsrError(
             422,
@@ -312,8 +339,17 @@ async def run_transcription_path(
     stage_callback: StageCallback | None = None,
     before_chunk: BeforeChunkCallback | None = None,
     after_chunk: AfterChunkCallback | None = None,
+    checkpoint_dir: Path | None = None,
 ) -> dict[str, object]:
     checked = validated or validate_transcription_request(manager, request)
+    if request.quality_profile == "quality_v1":
+        from asr_server.quality.pipeline import run_quality_transcription
+
+        return await run_quality_transcription(
+            upload_path, workspace=workspace, manager=manager, settings=settings,
+            request=request, checked=checked, stage_callback=stage_callback,
+            before_chunk=before_chunk, after_chunk=after_chunk, checkpoint_dir=checkpoint_dir,
+        )
     if stage_callback is not None:
         await stage_callback("preprocessing", {"percent": 1.0})
     normalized = await normalize_audio_path_to_wav_async(

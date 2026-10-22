@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from time import perf_counter
 from typing import Any, Protocol, TypeVar
 
-from asr_server.adapters.base import AudioInput, AsrAdapter, TranscriptionResult, TranscriptionTimings
+from asr_server.adapters.base import AudioInput, AsrAdapter, TimestampItem, TranscriptionResult, TranscriptionTimings
 from asr_server.errors import AsrError
 from asr_server.registry import Backend, ModelDefinition, ModelStatus
 
@@ -294,6 +294,36 @@ class ModelLifecycleManager:
             batch_size=batch_size,
         )
         return resolved_backend, replace(results[0], timings=timings)
+
+    async def align_text(
+        self,
+        audio: AudioInput,
+        *,
+        text: str,
+        model_id: str | None = None,
+        backend: Backend = "auto",
+        language: str = "auto",
+        timestamps: str = "auto",
+    ) -> list[TimestampItem]:
+        """Align supplied text under the same GPU lease as transcription.
+
+        The adapter must align the supplied text, never silently transcribe a
+        replacement. Returned offsets are relative to the supplied audio view.
+        """
+        async def operation(runtime: ModelRuntime, selected_model_id: str, resolved_backend: str) -> list[TranscriptionResult]:
+            del selected_model_id, resolved_backend
+            align = getattr(runtime.adapter, "align_text", None)
+            if not callable(align):
+                raise AsrError(422, "capability_not_supported", "adapter does not support supplied-text alignment")
+            result = await _call_adapter(lambda: align(audio, text=text, language=language, timestamps=timestamps))
+            if not isinstance(result, list) or not all(isinstance(item, TimestampItem) for item in result):
+                raise AsrError(422, "alignment_failed", "adapter returned invalid supplied-text alignment")
+            return [TranscriptionResult(text, 0.0, language, [], timestamps=result)]
+
+        _backend, results, _timings = await self._transcribe_managed(
+            model_id=model_id, backend=backend, timestamps=timestamps, operation=operation,
+        )
+        return results[0].timestamps
 
     async def transcribe_chunks(
         self,

@@ -10,6 +10,25 @@
 
 [开始部署](#开始部署) · [接入 Agent](#接入-agent) · [转录播客](#用-moss-转录播客) · [能力与边界](#能力与边界) · [完整文档](docs/README.md)
 
+## 局域网转录工作台（新增）
+
+网页与 API 共用 `18080`，提供个人账号、音视频断点上传、任务恢复、回听改字和 TXT/SRT/VTT/JSON 导出。工作台数据在本地服务器保存，任务结束后保留 7 天。
+
+```bash
+uv sync
+npm --prefix frontend ci
+npm --prefix frontend run build
+uv run python -m scripts.workbench_admin create admin
+# 无 GPU 开发预览；真实部署按 WSL 指南设置 adapter 和 alignment gate
+ASR_ADAPTER=mock ASR_ENABLE_QWEN_ALIGNMENT=1 uv run uvicorn asr_server.main:app --host 0.0.0.0 --port 18080
+```
+
+打开 `http://YOUR_WINDOWS_LAN_IP:18080/`；开发机打开 `http://127.0.0.1:18080/`。密码由管理员交互创建，没有默认账号密码。生产只需构建后的静态文件，无需常驻 Node 服务。
+
+工作台使用新的 `quality_v1` 候选流程：完整覆盖切分、词库快照、局部复核、真实字词对齐；**尚需真实长音频与人工参考文本验证，不宣称六小时质量已达标**。旧 `/v1/**` 默认 `legacy`，原有客户端无需更改。
+
+详见 [工作台契约](docs/product-workbench.md) 和 [质量评测](evaluation/README.md)。
+
 ## 转录之后，Agent 拿到什么
 
 普通转录返回正文；启用 Qwen 对齐后可以回看字/词时间；MOSS 返回带段级时间和匿名说话人标签的播客文本。批量工具把结果落成可交接的文件夹：

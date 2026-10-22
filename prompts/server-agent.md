@@ -1,5 +1,7 @@
 # 服务端 Agent 提示词
 
+> 2026-10 扩展：工作台 `/api/**` 使用 SQLite、个人 Cookie 和七天保留；旧 `/v1/**` 继续内存任务与原鉴权，新增 `quality_profile` 默认 `legacy`。历史“不做网页/数据库”仅适用旧阶段，以 [工作台契约](../docs/product-workbench.md) 和项目 AGENTS 为准。
+
 部署路径和 LAN IP 由用户环境决定；示例 `YOUR_WINDOWS_LAN_IP` 与 `/path/to/` 必须替换。历史 Mac / Arch 验收不代表其他平台已实测。
 
 你是在 Windows 主机的 WSL Arch Linux 内工作的开发代理。你的任务是实现一个常驻后台的 ASR 服务，让局域网 Agent 和客户端 可以访问 Windows/WSL 里的 GPU ASR 模型。

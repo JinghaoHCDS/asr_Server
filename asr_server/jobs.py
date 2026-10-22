@@ -8,6 +8,7 @@ import os
 import shutil
 import tempfile
 from collections import deque
+from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -148,6 +149,8 @@ class JobManager:
         self._jobs: dict[str, TranscriptionJob] = {}
         self._idempotency: dict[str, str] = {}
         self._queue: deque[str] = deque()
+        self._external: dict[str, Callable[[], Awaitable[None]]] = {}
+        self._running_external: str | None = None
         self._condition = asyncio.Condition()
         self._worker: asyncio.Task[None] | None = None
         self._sweeper: asyncio.Task[None] | None = None
@@ -203,6 +206,38 @@ class JobManager:
             self._sweeper = None
         for job in list(self._jobs.values()):
             await self._cleanup_job_files(job)
+        self._external.clear()
+
+    async def enqueue_external(self, key: str, operation: Callable[[], Awaitable[None]]) -> None:
+        """Share the legacy FIFO worker with durable workbench operations.
+
+        The durable owner persists state and cancellation. This manager only
+        schedules its operation; external records are never visible via /v1/jobs.
+        """
+        await self.start()
+        async with self._condition:
+            if key in self._jobs:
+                raise AsrError(409, "job_id_conflict", "job identifier already exists")
+            if key in self._external:
+                return
+            if self._active_job_count() >= self._settings.max_queued_jobs:
+                raise AsrError(429, "job_queue_full", "too many queued or running transcription jobs")
+            self._external[key] = operation
+            self._queue.append(key)
+            self._condition.notify()
+
+    def external_queue_position(self, key: str) -> int:
+        return self._queue_position(key)
+
+    async def cancel_external(self, key: str) -> bool:
+        """Remove a waiting operation; never interrupt an active GPU call."""
+        async with self._condition:
+            if key not in self._queue or key not in self._external:
+                return False
+            self._queue.remove(key)
+            self._external.pop(key, None)
+            self._condition.notify_all()
+            return True
 
     async def create_job(
         self,
@@ -335,8 +370,21 @@ class JobManager:
                 if self._closed and not self._queue:
                     return
                 job_id = self._queue.popleft()
-                job = self._jobs[job_id]
-            await self._run_job(job)
+                external = self._external.get(job_id)
+                if external is not None:
+                    self._running_external = job_id
+            if external is not None:
+                try:
+                    await external()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("workbench operation failed id=%s", job_id)
+                finally:
+                    self._external.pop(job_id, None)
+                    self._running_external = None
+            else:
+                await self._run_job(self._jobs[job_id])
 
     async def _run_job(self, job: TranscriptionJob) -> None:
         logger.info("starting transcription job id=%s model=%s", job.id, job.model)
@@ -559,7 +607,7 @@ class JobManager:
         return 0
 
     def _active_job_count(self) -> int:
-        return sum(1 for job in self._jobs.values() if job.status not in TERMINAL_STATUSES)
+        return sum(1 for job in self._jobs.values() if job.status not in TERMINAL_STATUSES) + len(self._external)
 
     def _elapsed_seconds(self, job: TranscriptionJob) -> float:
         end = job.completed_at or utc_now()

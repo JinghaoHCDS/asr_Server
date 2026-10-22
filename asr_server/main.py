@@ -11,6 +11,7 @@ from typing import Annotated, Any, cast
 from fastapi import Body, FastAPI, File, Form, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.staticfiles import StaticFiles
 
 from asr_server import __version__
 from asr_server.api.schemas import LoadRequest, UnloadRequest
@@ -100,10 +101,16 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
         manager: ModelLifecycleManager = lifespan_app.state.manager
         await job_manager.start()
         try:
+            if app_settings.workbench_enabled:
+                await lifespan_app.state.workbench.start()
             yield
         finally:
+            if app_settings.workbench_enabled:
+                await lifespan_app.state.workbench.shutdown()
             await job_manager.shutdown()
             await manager.shutdown()
+            if app_settings.workbench_enabled:
+                lifespan_app.state.workbench.close()
 
     app = GatewayApp(
         title="WSL ASR Server",
@@ -200,6 +207,7 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
         purpose: Annotated[str, Form()] = "transcription",
         pause_threshold_seconds: Annotated[float, Form()] = 0.8,
         idempotency_key: Annotated[str | None, Form()] = None,
+        quality_profile: Annotated[str, Form()] = "legacy",
     ) -> dict[str, object] | PlainTextResponse | JSONResponse:
         del temperature
         manager: ModelLifecycleManager = app.state.manager
@@ -220,6 +228,7 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
             purpose=purpose,
             pause_threshold_seconds=pause_threshold_seconds,
             idempotency_key=idempotency_key,
+            quality_profile=quality_profile,
         )
         validated = validate_transcription_request(manager, request)
         workspace = await app.state.workspace_manager.store_upload(file)
@@ -278,6 +287,7 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
         purpose: Annotated[str, Form()] = "transcription",
         pause_threshold_seconds: Annotated[float, Form()] = 0.8,
         idempotency_key: Annotated[str | None, Form()] = None,
+        quality_profile: Annotated[str, Form()] = "legacy",
     ) -> dict[str, object]:
         del temperature
         request = _transcription_request(
@@ -297,6 +307,7 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
             purpose=purpose,
             pause_threshold_seconds=pause_threshold_seconds,
             idempotency_key=idempotency_key,
+            quality_profile=quality_profile,
         )
         manager: ModelLifecycleManager = app.state.manager
         validate_transcription_request(manager, request)
@@ -331,6 +342,13 @@ def create_app(settings: Settings | None = None, adapter_delay_seconds: float = 
             "forced alignment is not enabled in this server",
         )
 
+    if app_settings.workbench_enabled:
+        from asr_server.workbench.router import install_workbench
+
+        app.state.workbench = install_workbench(app, app_settings)
+        static_dir = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+        if static_dir.is_dir():
+            app.mount("/", StaticFiles(directory=static_dir, html=True), name="workbench")
     return app
 
 
@@ -352,6 +370,7 @@ def _transcription_request(
     purpose: str,
     pause_threshold_seconds: float,
     idempotency_key: str | None,
+    quality_profile: str = "legacy",
 ) -> TranscriptionRequest:
     profile_defaults = {
         "transcription": ("json", "none", False, "off"),
@@ -376,6 +395,7 @@ def _transcription_request(
         purpose=purpose,
         pause_threshold_seconds=pause_threshold_seconds,
         idempotency_key=idempotency_key,
+        quality_profile=quality_profile,
     )
 
 

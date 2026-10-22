@@ -76,6 +76,13 @@ def _qwen_worker_main(conn: Connection, model_id: str, enable_alignment: bool) -
                     )
                     conn.send({"id": request_id, "ok": True, "result": _result_to_payload(result)})
                     continue
+                if op == "align_text":
+                    items = _run_async(backend.align_text(
+                        request["audio"], text=str(request["text"]), language=str(request["language"]),
+                        timestamps=str(request.get("timestamps", "auto")),
+                    ))
+                    conn.send({"id": request_id, "ok": True, "result": [item.to_api() for item in items]})
+                    continue
                 if op == "transcribe_batch":
                     results = _run_async(
                         backend.transcribe_batch(
@@ -288,6 +295,15 @@ class QwenAsrAdapter:
         self.loaded_backend = None
         self._transport.close(force=True)
 
+    async def align_text(
+        self, audio: AudioInput, *, text: str, language: str = "auto", timestamps: str = "auto",
+    ) -> list[TimestampItem]:
+        payload = self._request(
+            "align_text", timeout_seconds=self._inference_timeout_seconds,
+            audio=audio, text=text, language=language, timestamps=timestamps,
+        )
+        return [TimestampItem(**item) for item in payload]
+
     async def transcribe(
         self,
         audio: AudioInput,
@@ -394,6 +410,20 @@ class _QwenWorkerBackend:
         gc.collect()
         if cuda_empty_cache:
             self._release_cuda_cache()
+
+    async def align_text(
+        self, audio: AudioInput, *, text: str, language: str = "auto", timestamps: str = "auto",
+    ) -> list[TimestampItem]:
+        if not text.strip():
+            return []
+        if language == "auto":
+            # The aligner expects a language, not its ASR auto-detection
+            # sentinel. An edited Chinese-first document can be inferred from
+            # its supplied script without generating replacement text.
+            language = "Chinese" if any("\u4e00" <= char <= "\u9fff" for char in text) else "English"
+        with materialized_audio_path(audio, suffix=".wav") as audio_path:
+            items, _warnings = self._align(str(audio_path), text, language, requested_granularity=timestamps)
+        return items
 
     async def transcribe(
         self,
