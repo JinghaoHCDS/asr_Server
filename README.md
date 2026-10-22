@@ -47,7 +47,7 @@
 
 ```bash
 mkdir -p ~/services
-git clone https://github.com/Fragtex254/asr_Server.git ~/services/asr-server
+git clone https://github.com/JinghaoHCDS/asr_Server.git ~/services/asr-server
 cd ~/services/asr-server
 
 npm --prefix frontend ci
