@@ -17,7 +17,7 @@ from asr_server.errors import AsrError
 from asr_server.quality import PROFILE_VERSION
 from asr_server.quality.checkpoints import Checkpoints, file_digest, fingerprint
 from asr_server.quality.glossary import glossary_context, normalize_terms
-from asr_server.quality.splitter import QualityChunk, audio_has_energy, plan_quality_chunks
+from asr_server.quality.splitter import QualityChunk, audio_has_energy, empty_audio_evidence, plan_quality_chunks
 from asr_server.quality.segments import reading_segments
 
 if TYPE_CHECKING:
@@ -34,7 +34,7 @@ def _issues(result: TranscriptionResult, snapshot: dict[str, object] | None) -> 
     issues: list[str] = []
     if result.generation.truncated:
         issues.append("generation_truncated")
-    if not result.text.strip():
+    if not result.text.strip() and "confirmed_empty_audio" not in result.warnings:
         issues.append("empty_transcription")
     if _REPEATS.search(re.sub(r"\s+", "", result.text)):
         issues.append("suspected_repetition")
@@ -65,6 +65,8 @@ def _owned_text(result: TranscriptionResult, chunk: QualityChunk) -> tuple[str, 
     # Text ownership is always determined by real timestamps. Never reuse the
     # old fuzzy prefix deletion or invent equally spaced word timestamps.
     if not absolute:
+        if not result.text.strip():
+            return "", []
         raise AsrError(422, "alignment_required", "overlapping quality chunks require real timestamps")
     if not selected:
         return "", []
@@ -149,17 +151,35 @@ async def run_quality_transcription(
     reviews: list[dict[str, object]] = []
     all_issues: list[dict[str, object]] = []
     results: list[TranscriptionResult] = []
+    empty_audio_records: list[dict[str, object]] = []
     max_tokens = request.max_new_tokens if request.max_new_tokens is not None else 4096
     if stage_callback:
         await stage_callback("loading_model", {"total_chunks": len(chunks), "completed_chunks": 0, "chunk_windows": [(chunk.start, chunk.end) for chunk in chunks], "split": {"strategy": "quality_low_energy", "chunk_count": len(chunks), "soft_chunk_seconds": target, "hard_chunk_seconds": 180, "overlap_seconds": padding}})
 
     async def recognize(start: float, end: float) -> TranscriptionResult:
-        _backend, items, _timings = await manager.transcribe_chunks(
-            [AudioPath(normalized.path, start, end)], model_id=checked.selected_model,
-            backend=request.backend, language=request.language, timestamps="auto", context=prompt,
-            max_new_tokens=max_tokens, batch_size=1,
-        )
-        return items[0]
+        try:
+            _backend, items, _timings = await manager.transcribe_chunks(
+                [AudioPath(normalized.path, start, end)], model_id=checked.selected_model,
+                backend=request.backend, language=request.language, timestamps="auto", context=prompt,
+                max_new_tokens=max_tokens, batch_size=1,
+            )
+            result = items[0]
+        except AsrError as error:
+            if error.code != "empty_transcription":
+                raise
+            evidence = await asyncio.to_thread(empty_audio_evidence, normalized.path, start, end)
+            if evidence is None:
+                raise
+            result = TranscriptionResult("", end - start, request.language, [])
+        else:
+            if result.text.strip() or result.generation.truncated:
+                return result
+            evidence = await asyncio.to_thread(empty_audio_evidence, normalized.path, start, end)
+            if evidence is None:
+                return result
+        empty_audio_records.append({"method": "empty_audio", "start": start, "end": end,
+                                    "accepted": True, "evidence": evidence})
+        return replace(result, warnings=[*result.warnings, "confirmed_empty_audio"])
 
     for index, chunk in enumerate(chunks):
         if before_chunk:
@@ -169,11 +189,13 @@ async def run_quality_transcription(
         cached = await asyncio.to_thread(checkpoints.load, index)
         if cached is not None:
             result, cached_reviews, cached_extra = cached
+            chunk_reviews = cached_reviews
             reviews.extend(cached_reviews)
             if cached_extra > budget + 0.001 or extra_seconds > budget + 0.001:
                 raise AsrError(409, "checkpoint_version_mismatch", "checkpoint retry budget is invalid")
         else:
-            chunk_reviews: list[dict[str, object]] = []
+            chunk_reviews = []
+            empty_records_start = len(empty_audio_records)
             initial_error: AsrError | None = None
             result = TranscriptionResult("", chunk.duration, request.language, [])
             try:
@@ -183,11 +205,6 @@ async def run_quality_transcription(
                     raise
                 initial_error = error
             causes = [initial_error.code] if initial_error else _issues(result, request.glossary_snapshot)
-            if "empty_transcription" in causes and not await asyncio.to_thread(audio_has_energy, normalized.path, chunk.start, chunk.end, 0.0):
-                # Pure digital silence is a valid empty result; energy is only
-                # used as a conservative trigger, never a speech assertion.
-                causes = [cause for cause in causes if cause != "empty_transcription"]
-                initial_error = None
             chunk_extra = 0.0
             review_key = f"chunk:{index}"
             for attempt in range(checkpoints.review_attempts.get(review_key, 0) + 1, 3):
@@ -231,13 +248,18 @@ async def run_quality_transcription(
                 else:
                     initial_error = retry_error
                     causes = [retry_error.code]
+            chunk_reviews.extend({**record, "chunk_index": index} for record in empty_audio_records[empty_records_start:])
             reviews.extend(chunk_reviews)
             if initial_error or "generation_truncated" in causes or "empty_transcription" in causes:
-                raise AsrError(422, "quality_incomplete", "audio interval could not be completely transcribed within the review budget", {"start": chunk.start, "end": chunk.end, "chunk_index": index, "cause": initial_error.code if initial_error else causes[0], "partial_text": "\n\n".join(item.text for item in results), "review_audio_seconds": extra_seconds, "review_budget_seconds": budget})
+                stop_reason = "review_attempt_limit" if checkpoints.review_attempts.get(review_key, 0) >= 2 else "review_audio_budget"
+                raise AsrError(422, "quality_incomplete", "audio interval remains unresolved after bounded automatic review", {"start": chunk.start, "end": chunk.end, "chunk_index": index, "cause": initial_error.code if initial_error else causes[0], "stop_reason": stop_reason, "partial_text": "\n\n".join(item.text for item in results), "review_audio_seconds": extra_seconds, "review_budget_seconds": budget})
             await asyncio.to_thread(checkpoints.save, index, result, chunk_reviews, chunk_extra)
+        for record in chunk_reviews:
+            evidence = record.get("evidence")
+            if record.get("method") == "empty_audio" and isinstance(evidence, dict) and evidence.get("method") == "near_digital_silence_tail":
+                all_issues.append({"kind": "near_silent_tail", "start": record["start"], "end": record["end"],
+                                   "chunk_index": index, "status": "needs_review", "evidence": evidence})
         for cause in _issues(result, request.glossary_snapshot):
-            if cause == "empty_transcription" and not await asyncio.to_thread(audio_has_energy, normalized.path, chunk.start, chunk.end, 0.0):
-                continue
             all_issues.append({"kind": cause, "start": chunk.core_start, "end": chunk.core_end, "chunk_index": index, "status": "needs_review"})
         results.append(result)
         if after_chunk:

@@ -4,6 +4,7 @@ import { Icon } from './icons';
 
 function issueText(issue: Issue | string) {
   if (typeof issue === 'string') return issue;
+  if (issue.kind === 'near_silent_tail') return '尾段接近静音，未识别出文字，可回听确认';
   const names: Record<string, string> = { repetition: '检测到疑似重复，请回听确认', suspected_repetition: '检测到疑似重复，请回听确认', empty_speech: '此处可能有语音未被识别', empty_transcription: '此处未识别出文字，请回听确认', term_candidate: '术语写法需要确认', suspected_term: '术语写法需要确认', boundary_conflict: '分段交界处需要确认', review_budget_exhausted: '此处仍需要人工回听', alignment_failed: '字幕对齐未完成', suspected_uncovered_audio: '此处有声音但未对齐到文字，请回听确认', alignment_unavailable_mock: '此测试结果没有真实时间对齐', alignment_text_mapping: '文字与字幕对齐关系需要确认', generation_truncated: '此处识别输出可能不完整' };
   return names[issue.kind || issue.code || issue.type || ''] || issue.message || '此片段需要回听确认';
 }

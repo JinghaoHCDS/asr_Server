@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import wave
+from array import array
 from dataclasses import replace
 from pathlib import Path
 
@@ -16,7 +17,7 @@ from asr_server.lifecycle import ModelLifecycleManager
 from asr_server.quality.checkpoints import Checkpoints
 from asr_server.quality.glossary import glossary_context, normalize_terms
 from asr_server.quality.pipeline import _owned_text
-from asr_server.quality.splitter import QualityChunk, plan_quality_chunks
+from asr_server.quality.splitter import QualityChunk, empty_audio_evidence, plan_quality_chunks
 from asr_server.quality.segments import reading_segments
 from asr_server.registry import default_models
 from asr_server.transcription import TranscriptionRequest, run_transcription_path, validate_transcription_request
@@ -287,5 +288,145 @@ async def test_quiet_nonzero_audio_is_not_silently_accepted_as_digital_silence(t
         else:
             result = await run_transcription_path(source, workspace=tmp_path, manager=manager, settings=Settings(), request=request())
             assert result['text'] == ''
+    finally:
+        await manager.shutdown()
+
+
+def write_pcm_samples(path: Path, samples: array[int]) -> None:
+    with wave.open(str(path), "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(16000)
+        output.writeframes(samples.tobytes())
+
+
+@pytest.mark.parametrize(
+    ("peak", "nonzero_count", "last_nonzero", "file_seconds", "expected"),
+    [
+        (0, 0, 0, 10, "digital_silence"),
+        (4, 8000, 7999, 10, "near_digital_silence_tail"),  # Exactly 5% nonzero.
+        (4, 8001, 8000, 10, None),
+        (5, 1, 0, 10, None),
+        (4, 1, 0, 11, None),  # A quiet interior interval is never a tail.
+        (4, 1, 79999, 10, "near_digital_silence_tail"),  # Exactly half is all zero.
+        (4, 1, 80000, 10, None),
+        (1, 160000, 159999, 10, None),  # Constant quiet audio has no zero suffix.
+    ],
+)
+def test_empty_audio_evidence_preserves_conservative_tail_boundaries(
+    tmp_path: Path, peak: int, nonzero_count: int, last_nonzero: int,
+    file_seconds: int, expected: str | None,
+) -> None:
+    samples = array("h", [0]) * (file_seconds * 16000)
+    if nonzero_count:
+        samples[:nonzero_count] = array("h", [peak]) * nonzero_count
+        if last_nonzero >= nonzero_count:
+            samples[nonzero_count - 1] = 0
+            samples[last_nonzero] = peak
+    source = tmp_path / "tail.wav"
+    write_pcm_samples(source, samples)
+    evidence = empty_audio_evidence(source, 0, 10)
+    if expected is None:
+        assert evidence is None
+    else:
+        assert evidence is not None and evidence["method"] == expected
+
+
+def test_near_silent_tail_requires_at_least_one_second_of_digital_silence(tmp_path: Path) -> None:
+    samples = array("h", [0]) * 16000
+    samples[0] = 1
+    source = tmp_path / "short-tail.wav"
+    write_pcm_samples(source, samples)
+    assert empty_audio_evidence(source, 0, 1) is None
+
+
+@pytest.mark.asyncio
+async def test_near_silent_tail_is_recognized_then_delivered_with_review_evidence(tmp_path: Path) -> None:
+    class EmptyAdapter(RecordingAdapter):
+        async def transcribe(self, audio: AudioInput, *, model_id: str, backend: str, language: str, context: str, timestamps: str = "none", max_new_tokens: int | None = None) -> TranscriptionResult:
+            self.calls.append(max_new_tokens)
+            raise AsrError(422, "empty_transcription", "no text")
+
+    samples = array("h", [0]) * 160000
+    samples[:1600] = array("h", [4]) * 1600
+    source = tmp_path / "tail.wav"
+    write_pcm_samples(source, samples)
+    adapter = EmptyAdapter()
+    manager = ModelLifecycleManager(default_models(enable_qwen_alignment=True), lambda _: adapter, idle_unload_seconds=0)
+    try:
+        for _ in range(2):
+            result = await run_transcription_path(source, workspace=tmp_path, manager=manager, settings=Settings(), request=request(), checkpoint_dir=tmp_path / "checkpoints")
+            assert result["text"] == "" and result["timestamps"] == []
+            quality = result["quality"]
+            assert isinstance(quality, dict) and quality["status"] == "needs_review"
+            issues = quality["issues"]
+            assert isinstance(issues, list)
+            tail_issues = [issue for issue in issues if issue["kind"] == "near_silent_tail"]
+            assert len(tail_issues) == 1
+            issue = tail_issues[0]
+            assert issue["status"] == "needs_review" and issue["start"] == 0 and issue["end"] == 10
+            evidence = issue["evidence"]
+            assert isinstance(evidence, dict) and evidence["method"] == "near_digital_silence_tail"
+        assert adapter.calls == [4096]  # Real recognition first; the second run reuses its checkpoint.
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_resegmented_speech_with_silent_subwindow_completes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    class MixedAdapter(RecordingAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.windows: list[tuple[float, float | None]] = []
+
+        async def transcribe(self, audio: AudioInput, *, model_id: str, backend: str, language: str, context: str, timestamps: str = "none", max_new_tokens: int | None = None) -> TranscriptionResult:
+            assert isinstance(audio, AudioPath) and audio.end is not None
+            window = (audio.start, audio.end)
+            self.windows.append(window)
+            if window == (0, 60):
+                raise AsrError(422, "generation_truncated", "retry the shorter windows")
+            if window == (30, 60):
+                raise AsrError(422, "empty_transcription", "silent subwindow")
+            text = "第一段。" if window == (0, 30) else "后续段。"
+            duration = audio.end - audio.start
+            return TranscriptionResult(text, duration, "zh", ["mock_adapter"], timestamps=[TimestampItem(text, 0, duration, "word")])
+
+    # Fixed windows isolate retry behavior from the independently tested planner.
+    windows = [QualityChunk(index, index * 60, (index + 1) * 60, index * 60, (index + 1) * 60) for index in range(4)]
+    monkeypatch.setattr("asr_server.quality.pipeline.plan_quality_chunks", lambda *_args: (windows, 240))
+    samples = array("h", [100]) * (240 * 16000)
+    samples[30 * 16000:60 * 16000] = array("h", [0]) * (30 * 16000)
+    source = tmp_path / "speech-and-silence.wav"
+    write_pcm_samples(source, samples)
+    adapter = MixedAdapter()
+    manager = ModelLifecycleManager(default_models(enable_qwen_alignment=True), lambda _: adapter, idle_unload_seconds=0)
+    try:
+        result = await run_transcription_path(source, workspace=tmp_path, manager=manager, settings=Settings(), request=request())
+        assert str(result["text"]).startswith("第一段。")
+        assert str(result["text"]).count("后续段。") == 3
+        assert adapter.windows == [(0, 60), (0, 30), (30, 60), (60, 120), (120, 180), (180, 240)]
+        quality = result["quality"]
+        assert isinstance(quality, dict) and quality["review_audio_seconds"] == 60
+        reviews = quality["reviews"]
+        assert isinstance(reviews, list) and any(review["method"] == "shorter_windows" and review["accepted"] for review in reviews)
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_overlapping_digital_silence_does_not_require_fabricated_alignment(tmp_path: Path) -> None:
+    class EmptyAdapter(RecordingAdapter):
+        async def transcribe(self, audio: AudioInput, *, model_id: str, backend: str, language: str, context: str, timestamps: str = "none", max_new_tokens: int | None = None) -> TranscriptionResult:
+            self.calls.append(max_new_tokens)
+            raise AsrError(422, "empty_transcription", "digital silence")
+
+    source = tmp_path / "silence.wav"
+    source.write_bytes(wav_bytes(61))
+    adapter = EmptyAdapter()
+    manager = ModelLifecycleManager(default_models(enable_qwen_alignment=True), lambda _: adapter, idle_unload_seconds=0)
+    try:
+        result = await run_transcription_path(source, workspace=tmp_path, manager=manager, settings=Settings(), request=request(overlap_seconds=1, quality_chunk_seconds=30))
+        assert result["text"] == "" and result["timestamps"] == []
+        assert len(adapter.calls) == 3  # Every overlapping input was actually recognized.
     finally:
         await manager.shutdown()

@@ -76,3 +76,45 @@ def audio_has_energy(path: Path, start: float, end: float, threshold: float = 30
                 return True
             remaining -= count
     return False
+
+
+def empty_audio_evidence(path: Path, start: float, end: float) -> dict[str, object] | None:
+    """Validate an ASR-empty interval without treating low energy as no speech.
+
+    Apart from exact digital silence, accept only a source tail with sparse
+    PCM16 rounding residue (at most four quantization steps) followed by a
+    substantial exact-zero suffix. Constant quiet signals, music, and even a
+    single stronger sample remain unresolved. The residual-tail case must be
+    exposed for review; this function never skips an ASR call.
+    """
+    with wave.open(str(path), "rb") as source:
+        if source.getsampwidth() != 2 or source.getnchannels() != 1:
+            return None
+        rate, frames = source.getframerate(), source.getnframes()
+        first = max(0, min(round(start * rate), frames))
+        stop = max(first, min(round(end * rate), frames))
+        source.setpos(first)
+        total = nonzero = peak = 0
+        last_nonzero = -1
+        while total < stop - first:
+            samples = array("h", source.readframes(min(rate, stop - first - total)))
+            if not samples:
+                break
+            for index, value in enumerate(samples):
+                if value:
+                    nonzero += 1
+                    peak = max(peak, abs(value))
+                    last_nonzero = total + index
+            total += len(samples)
+        if not total or total != stop - first:
+            return None
+        evidence: dict[str, object] = {
+            "peak_pcm16": peak, "nonzero_samples": nonzero, "samples": total,
+            "trailing_zero_seconds": (total - last_nonzero - 1) / rate,
+        }
+        if not nonzero:
+            return {"method": "digital_silence", **evidence}
+        trailing_zeros = total - last_nonzero - 1
+        if stop == frames and peak <= 4 and nonzero * 20 <= total and trailing_zeros >= max(rate, total / 2):
+            return {"method": "near_digital_silence_tail", **evidence}
+    return None
